@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+configs/
+routes/
+build/
+dist/
+installer-output/
+*.local.json
+*.cache.json
+.env

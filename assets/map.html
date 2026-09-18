@@ -1,0 +1,865 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SJTU route desk</title>
+  <style>
+    :root { color-scheme: dark; --ink: #dce7e4; --muted: #8da39f; --line: #36545a; --accent: #f1745d; }
+    * { box-sizing: border-box; }
+    html, body, #map { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+    body { background: #12252d; color: var(--ink); font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+    #map { position: relative; background: #142c33; }
+    #tencentMap { position: absolute; inset: 0; display: none; }
+    #offlineCanvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    #drawCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    #map.drawing #drawCanvas { pointer-events: auto; cursor: crosshair; }
+    #status { position: absolute; left: 18px; top: 16px; z-index: 8; padding: 7px 10px; border: 1px solid #4d6d71; background: rgba(14, 35, 42, .9); border-radius: 3px; font-size: 12px; letter-spacing: .04em; }
+    #status strong { color: #f9c6a8; font-weight: 600; }
+    #hint { position: absolute; left: 18px; bottom: 18px; z-index: 8; max-width: 360px; padding: 10px 12px; background: rgba(14, 35, 42, .9); border-left: 3px solid var(--accent); color: #c5d5d1; font-size: 12px; line-height: 1.5; }
+    #scale { position: absolute; right: 18px; bottom: 18px; z-index: 8; color: #b8cbc7; font: 11px Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <div id="map">
+    <div id="tencentMap"></div>
+    <canvas id="offlineCanvas"></canvas>
+    <canvas id="drawCanvas"></canvas>
+    <div id="status"><strong id="providerLabel">离线坐标网格</strong><span id="statusText"> · 真实道路底图未加载</span></div>
+    <div id="hint">道路画笔拖动到真实节点后沿已声明的腾讯道路连接；候选节点会高亮，不可达时保留当前路线。缩放与平移只在编辑关闭时生效。</div>
+    <div id="scale">WGS84 / coordinate workspace</div>
+  </div>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script>
+    (() => {
+      const root = document.getElementById('map');
+      const tencentContainer = document.getElementById('tencentMap');
+      const offlineCanvas = document.getElementById('offlineCanvas');
+      const drawCanvas = document.getElementById('drawCanvas');
+      const offlineCtx = offlineCanvas.getContext('2d');
+      const drawCtx = drawCanvas.getContext('2d');
+      const providerLabel = document.getElementById('providerLabel');
+      const statusText = document.getElementById('statusText');
+      const scaleLabel = document.getElementById('scale');
+      const state = {
+        route: {version: 1, campus: 'sjtu_minhang', coordinate_system: 'wgs84', provider: 'offline-grid', strokes: []},
+        drawing: false,
+        snapMode: true,
+        currentStroke: null,
+        snapStartNode: null,
+        snapCurrentNode: null,
+        snapCandidateNode: null,
+        snapPressedNode: null,
+        snapPreview: null,
+        snapSegments: [],
+        bridge: null,
+        tencentMap: null,
+        tencentPolylines: [],
+        tencentRoadPolylines: [],
+        tracePolylines: [],
+        roadPolylines: [],
+        roadNodes: [],
+        roadGraph: {edges: []},
+        graphIndex: {nodes: new Map(), edges: new Map(), adjacency: new Map()},
+        pathTree: null,
+        previewFrom: null,
+        tencentRoadOverlay: {routes: []},
+        // Native Tencent overlays are expensive to recreate.  Keep them
+        // stable while the pointer moves and update each layer only after its
+        // source data changes.
+        routeOverlayDirty: true,
+        traceOverlayDirty: true,
+        tencentRoadOverlayDirty: true,
+        roadGraphRenderToken: 0,
+        loadingKey: '',
+        config: {},
+        // The default view is fitted to the user-confirmed SJTU Minhang
+        // working area. It is a viewport hint only; road edges remain
+        // manually verified data and are never inferred from this rectangle.
+        view: {
+          lat: 31.0281, lon: 121.4323, spanLat: .020, spanLon: .030, zoom: 1, panX: 0, panY: 0,
+          // Viewport bounds come from the official SJTU Minhang map's campus
+          // working area. They only fit the map; they do not create road edges.
+          bounds: {south: 31.0182, west: 121.4179, north: 31.0384, east: 121.4467}
+        },
+        pointer: null
+      };
+
+      function sizeCanvas() {
+        const rect = root.getBoundingClientRect();
+        const ratio = Math.max(1, window.devicePixelRatio || 1);
+        [offlineCanvas, drawCanvas].forEach((canvas) => {
+          canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+          canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+          canvas.style.width = rect.width + 'px';
+          canvas.style.height = rect.height + 'px';
+        });
+        offlineCtx.setTransform(ratio, 0, 0, ratio, 0, 0);
+        drawCtx.setTransform(ratio, 0, 0, ratio, 0, 0);
+        render();
+      }
+      function width() { return root.clientWidth; }
+      function height() { return root.clientHeight; }
+      function pixelFromPoint(point) {
+        const v = state.view;
+        return {
+          x: width() / 2 + state.view.panX + (point.longitude - v.lon) / v.spanLon * width() * v.zoom,
+          y: height() / 2 + state.view.panY - (point.latitude - v.lat) / v.spanLat * height() * v.zoom
+        };
+      }
+      function pointFromPixel(x, y) {
+        const v = state.view;
+        return {
+          latitude: v.lat - (y - height() / 2 - v.panY) / (height() * v.zoom) * v.spanLat,
+          longitude: v.lon + (x - width() / 2 - v.panX) / (width() * v.zoom) * v.spanLon
+        };
+      }
+      function cleanPoint(point) {
+        return {latitude: Number(point.latitude), longitude: Number(point.longitude)};
+      }
+      function routeJson() {
+        const copy = JSON.parse(JSON.stringify(state.route));
+        if (state.currentStroke && state.currentStroke.length) copy.strokes.push(state.currentStroke);
+        return JSON.stringify(copy);
+      }
+      function emitRoute() {
+        state.routeOverlayDirty = true;
+        if (state.bridge && state.bridge.receiveRoute) state.bridge.receiveRoute(routeJson());
+      }
+      function setStatus(provider, detail) {
+        providerLabel.textContent = provider;
+        statusText.textContent = detail ? ' · ' + detail : '';
+        if (state.bridge && state.bridge.reportStatus) state.bridge.reportStatus(provider + (detail ? ' · ' + detail : ''));
+      }
+      function providerStatus(editing) {
+        if (state.tencentMap) {
+          if (state.route.strokes.length && state.route.coordinate_system !== 'gcj02') {
+            return ['腾讯地图', '底图已加载 · 现有 WGS84 路线未自动转换'];
+          }
+          return ['腾讯地图', editing ? '底图已加载 · 绘制锁定平移' : '底图已加载 · 校园道路请现场核验'];
+        }
+        return ['离线坐标网格', editing ? '绘制锁定平移 · 真实道路底图未加载' : '真实道路底图未加载 · 可独立绘图'];
+      }
+      function refreshStatus(editing) {
+        const values = providerStatus(editing);
+        setStatus(values[0], values[1]);
+        scaleLabel.textContent = state.tencentMap ? 'GCJ-02 / Tencent JS API' : 'WGS84 / offline workspace';
+      }
+      function drawOfflineGrid() {
+        const w = width(), h = height();
+        offlineCtx.clearRect(0, 0, w, h);
+        offlineCtx.fillStyle = '#142c33'; offlineCtx.fillRect(0, 0, w, h);
+        offlineCtx.strokeStyle = 'rgba(115, 162, 157, .18)'; offlineCtx.lineWidth = 1;
+        const grid = 56;
+        for (let x = ((state.view.panX % grid) + grid) % grid; x < w; x += grid) { offlineCtx.beginPath(); offlineCtx.moveTo(x, 0); offlineCtx.lineTo(x, h); offlineCtx.stroke(); }
+        for (let y = ((state.view.panY % grid) + grid) % grid; y < h; y += grid) { offlineCtx.beginPath(); offlineCtx.moveTo(0, y); offlineCtx.lineTo(w, y); offlineCtx.stroke(); }
+        offlineCtx.fillStyle = 'rgba(221, 239, 232, .45)'; offlineCtx.font = '11px Consolas, monospace';
+        offlineCtx.fillText('31.03° N', 18, h - 24); offlineCtx.fillText('121.44° E', w - 78, h - 24);
+        offlineCtx.strokeStyle = 'rgba(241, 116, 93, .22)'; offlineCtx.setLineDash([4, 5]); offlineCtx.strokeRect(20, 20, w - 40, h - 40); offlineCtx.setLineDash([]);
+      }
+      function drawPath(ctx, stroke, color, widthPx, mapCoordinates) {
+        if (!stroke || !stroke.length) return;
+        const project = mapCoordinates && state.tencentMap ? tencentProjector() : pixelFromPoint;
+        ctx.beginPath();
+        stroke.forEach((point, index) => {
+          const p = project(point);
+          if (index === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        });
+        ctx.strokeStyle = color; ctx.lineWidth = widthPx; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
+      }
+      function pointDistanceM(first, second) {
+        const lat1 = Number(first.latitude), lat2 = Number(second.latitude);
+        const dLat = (lat2 - lat1) * Math.PI / 180;
+        const dLon = (Number(second.longitude) - Number(first.longitude)) * Math.PI / 180;
+        const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+        return 6371008.8 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0, 1 - a)));
+      }
+      function edgeWeight(edge) {
+        const declared = Number(edge && edge.length_m);
+        if (Number.isFinite(declared) && declared > 0) return declared;
+        const geometry = Array.isArray(edge && edge.geometry) ? edge.geometry : [];
+        return geometry.slice(1).reduce((sum, point, index) => sum + pointDistanceM(geometry[index], point), 0);
+      }
+      function edgeGeometryFrom(edge, nodeId) {
+        if (!edge || !Array.isArray(edge.geometry) || edge.geometry.length < 2) return [];
+        if (String(edge.start) === String(nodeId)) return edge.geometry.map(cleanPoint);
+        if (String(edge.end) === String(nodeId) && !edge.one_way) return edge.geometry.slice().reverse().map(cleanPoint);
+        return [];
+      }
+      function graphPath(startNodeId, endNodeId) {
+        const {nodes, edges, adjacency} = state.graphIndex;
+        const start = String(startNodeId), end = String(endNodeId);
+        if (!nodes.has(start) || !nodes.has(end)) return null;
+        if (start === end) return {edgeIds: [], nodeIds: [start], points: [cleanPoint(nodes.get(start))]};
+        if (!state.pathTree || state.pathTree.start !== start) {
+          const distances = new Map([[start, 0]]);
+          const previous = new Map();
+          const queue = [{distance: 0, nodeId: start}];
+          while (queue.length) {
+            queue.sort((a, b) => a.distance - b.distance || a.nodeId.localeCompare(b.nodeId));
+            const current = queue.shift();
+            if (!current) break;
+            if (current.distance > (distances.get(current.nodeId) ?? Infinity) + 1e-6) continue;
+            for (const neighbour of adjacency.get(current.nodeId) || []) {
+              const candidate = current.distance + neighbour.weight;
+              if (candidate < (distances.get(neighbour.nodeId) ?? Infinity)) {
+                distances.set(neighbour.nodeId, candidate);
+                previous.set(neighbour.nodeId, {nodeId: current.nodeId, edge: neighbour.edge});
+                queue.push({distance: candidate, nodeId: neighbour.nodeId});
+              }
+            }
+          }
+          state.pathTree = {start, distances, previous};
+        }
+        const {distances, previous} = state.pathTree;
+        if (!distances.has(end)) return null;
+        const edgeIds = [], pathNodes = [end];
+        let current = end;
+        while (current !== start) {
+          const step = previous.get(current);
+          if (!step) return null;
+          edgeIds.push(String(step.edge.id));
+          current = step.nodeId;
+          pathNodes.push(current);
+        }
+        edgeIds.reverse(); pathNodes.reverse();
+        const points = [];
+        let cursor = start;
+        for (let edgeIndex = 0; edgeIndex < edgeIds.length; edgeIndex += 1) {
+          const edgeId = edgeIds[edgeIndex];
+          const edge = edges.get(edgeId);
+          const geometry = edgeGeometryFrom(edge, cursor);
+          if (!geometry.length) return null;
+          if (points.length && pointDistanceM(points[points.length - 1], geometry[0]) <= 5) points.push(...geometry.slice(1));
+          else points.push(...geometry);
+          cursor = pathNodes[edgeIndex + 1];
+        }
+        return {edgeIds, nodeIds: pathNodes, points, distance: distances.get(end)};
+      }
+      function syncSnapStateFromRoute() {
+        const metadata = state.route && state.route.road_graph;
+        if (!state.snapMode || !metadata || !['snap', 'snap_nodes'].includes(metadata.mode)) {
+          state.snapStartNode = null; state.snapCurrentNode = null; state.snapSegments = [];
+          state.snapPressedNode = null; state.snapPreview = null; state.snapCandidateNode = null;
+          return;
+        }
+        state.snapStartNode = metadata.start_node_id ? String(metadata.start_node_id) : null;
+        state.snapCurrentNode = metadata.end_node_id ? String(metadata.end_node_id) : state.snapStartNode;
+        state.snapSegments = Array.isArray(metadata.snap_segments) ? JSON.parse(JSON.stringify(metadata.snap_segments)) : [];
+        if (!state.snapSegments.length && Array.isArray(metadata.edge_ids) && metadata.edge_ids.length && state.snapStartNode) {
+          state.snapSegments = [{from_node_id: state.snapStartNode, to_node_id: state.snapCurrentNode, edge_ids: metadata.edge_ids.map(String)}];
+        }
+        state.snapPressedNode = null; state.snapPreview = null; state.snapCandidateNode = null;
+      }
+      function syncSnapRouteFromSegments() {
+        const hadGeometry = Array.isArray(state.route.strokes) && state.route.strokes.some((stroke) => Array.isArray(stroke) && stroke.length);
+        const edgeIds = state.snapSegments.flatMap((segment) => Array.isArray(segment.edge_ids) ? segment.edge_ids.map(String) : []);
+        const metadata = {
+          edge_ids: edgeIds,
+          start_node_id: state.snapStartNode,
+          end_node_id: state.snapCurrentNode,
+          mode: 'snap_nodes',
+          snap_segments: JSON.parse(JSON.stringify(state.snapSegments))
+        };
+        if (edgeIds.length && state.snapStartNode) {
+          const points = pathPointsForEdges(edgeIds, state.snapStartNode);
+          if (points.length >= 2) state.route.strokes = [points];
+        } else if (!hadGeometry) {
+          state.route.strokes = [];
+        }
+        state.route.provider = 'tencent'; state.route.coordinate_system = 'gcj02'; state.route.road_graph = metadata;
+        emitRoute(); render();
+      }
+      function pathPointsForEdges(edgeIds, startNodeId) {
+        const edges = state.graphIndex.edges;
+        let cursor = String(startNodeId); const points = [];
+        for (const rawId of edgeIds) {
+          const edge = edges.get(String(rawId));
+          const geometry = edgeGeometryFrom(edge, cursor);
+          if (!geometry.length) return [];
+          if (points.length && pointDistanceM(points[points.length - 1], geometry[0]) <= 5) points.push(...geometry.slice(1));
+          else points.push(...geometry);
+          cursor = String(edge.start) === cursor ? String(edge.end) : String(edge.start);
+        }
+        return points;
+      }
+      function nodeAtPixel(x, y) {
+        const nodes = Array.isArray(state.roadGraph && state.roadGraph.nodes) ? state.roadGraph.nodes : [];
+        const hitRadius = 20, hysteresis = 8;
+        const project = state.tencentMap ? tencentProjector() : pixelFromPoint;
+        let best = null, bestDistance = Infinity, sticky = null;
+        for (const node of nodes) {
+          const projected = project(node);
+          const distance = Math.hypot(projected.x - x, projected.y - y);
+          if (!Number.isFinite(distance)) continue;
+          if (String(node.id) === state.snapCandidateNode && distance <= hitRadius + hysteresis) sticky = node;
+          if (distance < bestDistance || (distance === bestDistance && best && String(node.id).localeCompare(String(best.id)) < 0)) {
+            best = node; bestDistance = distance;
+          }
+        }
+        return sticky || (bestDistance <= hitRadius ? best : null);
+      }
+      function updateSnapPreview(node) {
+        const candidate = node ? String(node.id) : null;
+        if (candidate === state.snapCandidateNode && state.previewFrom === state.snapCurrentNode && state.snapPreview) return;
+        state.previewFrom = state.snapCurrentNode;
+        state.snapCandidateNode = node ? String(node.id) : null;
+        state.snapPreview = null;
+        if (!node) return;
+        if (state.snapCurrentNode) state.snapPreview = graphPath(state.snapCurrentNode, String(node.id));
+      }
+      function renderSnapPreview() {
+        if (!state.snapMode || !state.drawing || !state.tencentMap) return;
+        if (state.snapPreview && state.snapPreview.points && state.snapPreview.points.length >= 2) {
+          drawPath(drawCtx, state.snapPreview.points, '#f6c898', 4, true);
+          drawCtx.save(); drawCtx.setLineDash([6, 5]); drawCtx.strokeStyle = '#ffe6b5'; drawCtx.lineWidth = 2;
+          drawPath(drawCtx, state.snapPreview.points, '#ffe6b5', 2, true); drawCtx.restore();
+        }
+        if (state.snapCandidateNode) {
+          const nodes = Array.isArray(state.roadGraph && state.roadGraph.nodes) ? state.roadGraph.nodes : [];
+          const node = nodes.find((item) => String(item.id) === String(state.snapCandidateNode));
+          if (!node) return;
+          const p = tencentPixelFromPoint(node);
+          drawCtx.save(); drawCtx.beginPath(); drawCtx.arc(p.x, p.y, 10, 0, Math.PI * 2);
+          drawCtx.strokeStyle = state.snapPreview ? '#ffe6b5' : '#ff8d75'; drawCtx.lineWidth = 3; drawCtx.stroke(); drawCtx.restore();
+        }
+      }
+      function drawOfflineRoute() {
+        drawCtx.clearRect(0, 0, width(), height());
+        state.route.strokes.forEach((stroke) => drawPath(drawCtx, stroke, '#f1745d', 4, false));
+        if (state.currentStroke) drawPath(drawCtx, state.currentStroke, '#f6c898', 3, false);
+      }
+      function renderTencentRoute() {
+        if (!state.tencentMap || !window.qq || !qq.maps) return;
+        state.tencentPolylines.forEach((line) => line.setMap(null)); state.tencentPolylines = [];
+        state.route.strokes.filter((stroke) => stroke.length >= 2).forEach((stroke) => {
+          const line = new qq.maps.Polyline({
+            map: state.tencentMap,
+            path: stroke.map((point) => new qq.maps.LatLng(point.latitude, point.longitude)),
+            strokeColor: '#d9594c', strokeWeight: 6, strokeOpacity: .92,
+            lineCap: 'round', lineJoin: 'round'
+          });
+          state.tencentPolylines.push(line);
+        });
+        state.routeOverlayDirty = false;
+      }
+      function renderTraceOverlay() {
+        if (!state.tencentMap || !window.qq || !qq.maps) return;
+        (state.tracePolylines || []).forEach((line) => line.setMap(null));
+        state.tracePolylines = [];
+        const traces = Array.isArray(state.traceOverlay) ? state.traceOverlay : [];
+        traces.forEach((trace) => {
+          if (!Array.isArray(trace) || trace.length < 2) return;
+          const path = trace.map(cleanPoint).filter((point) => [point.latitude, point.longitude].every(Number.isFinite));
+          if (path.length < 2) return;
+          state.tracePolylines.push(new qq.maps.Polyline({
+            map: state.tencentMap,
+            path: path.map((point) => new qq.maps.LatLng(point.latitude, point.longitude)),
+            // Thin magenta is deliberately kept below the road width so that
+            // the unfiltered base map remains visible for visual verification.
+            strokeColor: '#ff00c8', strokeWeight: 2, strokeOpacity: .92,
+            lineCap: 'round', lineJoin: 'round', clickable: false
+          }));
+        });
+        state.traceOverlayDirty = false;
+      }
+      function renderTencentRoadOverlay() {
+        if (!state.tencentMap || !window.qq || !qq.maps) return;
+        (state.tencentRoadPolylines || []).forEach((line) => line.setMap(null));
+        state.tencentRoadPolylines = [];
+        const routes = state.tencentRoadOverlay && Array.isArray(state.tencentRoadOverlay.routes)
+          ? state.tencentRoadOverlay.routes : [];
+        routes.forEach((route, routeIndex) => {
+          if (!route || !Array.isArray(route.geometry) || route.geometry.length < 2) return;
+          const path = route.geometry.map(cleanPoint).filter((point) => [point.latitude, point.longitude].every(Number.isFinite));
+          if (path.length < 2) return;
+          state.tencentRoadPolylines.push(new qq.maps.Polyline({
+            map: state.tencentMap,
+            path: path.map((point) => new qq.maps.LatLng(point.latitude, point.longitude)),
+            // This distinct line marks geometry returned by the official
+            // walking endpoint. It is kept separate from the partial manual
+            // graph and is never treated as a complete campus road network.
+            strokeColor: routeIndex === 0 ? '#ffd166' : '#7dd3fc',
+            strokeWeight: 7,
+            strokeOpacity: .9,
+            lineCap: 'round', lineJoin: 'round', clickable: false
+          }));
+        });
+        state.tencentRoadOverlayDirty = false;
+      }
+      function setTencentRoadOverlay(raw) {
+        try {
+          const next = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          state.tencentRoadOverlay = next && Array.isArray(next.routes) ? next : {routes: []};
+          state.tencentRoadOverlayDirty = true;
+          renderTencentRoadOverlay();
+        } catch (error) {
+          state.tencentRoadOverlay = {routes: []};
+          state.tencentRoadOverlayDirty = true;
+          renderTencentRoadOverlay();
+        }
+      }
+      function setTraceOverlay(raw) {
+        try {
+          const next = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          const traces = Array.isArray(next) ? next : (next && Array.isArray(next.traces) ? next.traces : []);
+          state.traceOverlay = traces;
+          state.traceOverlayDirty = true;
+          renderTraceOverlay();
+        } catch (error) {
+          state.traceOverlay = [];
+          state.traceOverlayDirty = true;
+          renderTraceOverlay();
+        }
+      }
+      function renderRoadGraph() {
+        if (!state.tencentMap || !window.qq || !qq.maps) return;
+        const token = ++state.roadGraphRenderToken;
+        (state.roadPolylines || []).forEach((line) => line.setMap(null));
+        (state.roadNodes || []).forEach((node) => node.setMap(null));
+        state.roadPolylines = [];
+        state.roadNodes = [];
+        const edges = state.roadGraph && Array.isArray(state.roadGraph.edges) ? state.roadGraph.edges : [];
+        const nodes = state.roadGraph && Array.isArray(state.roadGraph.nodes) ? state.roadGraph.nodes : [];
+        let edgeIndex = 0;
+        let nodeIndex = 0;
+        const chunkSize = 24;
+        const drawChunk = () => {
+          if (token !== state.roadGraphRenderToken || !state.tencentMap) return;
+          const edgeEnd = Math.min(edges.length, edgeIndex + chunkSize);
+          for (; edgeIndex < edgeEnd; edgeIndex += 1) {
+            const edge = edges[edgeIndex];
+            if (!Array.isArray(edge.geometry) || edge.geometry.length < 2) continue;
+            const line = new qq.maps.Polyline({
+              map: state.tencentMap,
+              path: edge.geometry.map((point) => new qq.maps.LatLng(point.latitude, point.longitude)),
+              strokeColor: '#67b9b5', strokeWeight: 3, strokeOpacity: .62,
+              lineCap: 'round', lineJoin: 'round', clickable: false
+            });
+            state.roadPolylines.push(line);
+          }
+          if (edgeIndex < edges.length) {
+            window.requestAnimationFrame(drawChunk);
+            return;
+          }
+          if (typeof qq.maps.Circle === 'function') {
+            const nodeEnd = Math.min(nodes.length, nodeIndex + chunkSize);
+            for (; nodeIndex < nodeEnd; nodeIndex += 1) {
+              const node = nodes[nodeIndex];
+              const latitude = Number(node.latitude), longitude = Number(node.longitude);
+              if (![latitude, longitude].every(Number.isFinite)) continue;
+              const marker = new qq.maps.Circle({
+                map: state.tencentMap,
+                center: new qq.maps.LatLng(latitude, longitude),
+                radius: 8,
+                strokeColor: '#f6c898', strokeWeight: 1, strokeOpacity: .9,
+                fillColor: '#f6c898', fillOpacity: .78,
+                clickable: false
+              });
+              state.roadNodes.push(marker);
+            }
+          }
+          if (typeof qq.maps.Circle === 'function' && nodeIndex < nodes.length) window.requestAnimationFrame(drawChunk);
+        };
+        window.requestAnimationFrame(drawChunk);
+      }
+      function renderOverlay() {
+        drawCtx.clearRect(0, 0, width(), height());
+        if (state.tencentMap) {
+          // Committed paths are native Tencent overlays. The canvas only previews
+          // the in-progress pen stroke, so map panning never desynchronizes it.
+          if (state.currentStroke) drawPath(drawCtx, state.currentStroke, '#f6c898', 4, true);
+          renderSnapPreview();
+        } else {
+          state.route.strokes.forEach((stroke) => drawPath(drawCtx, stroke, '#f1745d', 4, false));
+          if (state.currentStroke) drawPath(drawCtx, state.currentStroke, '#f6c898', 3, false);
+        }
+      }
+      let renderPending = false;
+      function render() {
+        if (renderPending) return;
+        renderPending = true;
+        window.requestAnimationFrame(() => { renderPending = false; renderFrame(); });
+      }
+      function renderFrame() {
+        if (!state.tencentMap) drawOfflineGrid();
+        renderOverlay();
+        if (state.tencentMap) {
+          if (state.routeOverlayDirty) renderTencentRoute();
+          if (state.traceOverlayDirty) renderTraceOverlay();
+          if (state.tencentRoadOverlayDirty) renderTencentRoadOverlay();
+        }
+      }
+      function setRoute(raw) {
+        cancelSnapMove();
+        try {
+          const next = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          if (!next || !Array.isArray(next.strokes)) throw new Error('invalid route');
+          state.route = next; state.currentStroke = null;
+          state.routeOverlayDirty = true;
+          syncSnapStateFromRoute();
+          refreshStatus(state.drawing);
+          render();
+        } catch (error) { setStatus('路线数据错误', '请重新载入路线'); }
+      }
+      function setDrawingMode(enabled) {
+        cancelSnapMove();
+        if (typeof enabled === 'string') enabled = enabled === 'true';
+        state.drawing = !!enabled; root.classList.toggle('drawing', state.drawing);
+        if (!state.drawing && state.currentStroke && state.currentStroke.length) { state.route.strokes.push(state.currentStroke); state.currentStroke = null; emitRoute(); }
+        if (!state.drawing) { state.snapPressedNode = null; state.snapPreview = null; state.snapCandidateNode = null; }
+        if (state.tencentMap) {
+          state.tencentMap.setOptions({
+            draggable: !state.drawing,
+            scrollwheel: !state.drawing,
+            disableDoubleClickZoom: state.drawing,
+            keyboardShortcuts: !state.drawing
+          });
+        }
+        refreshStatus(state.drawing); render();
+      }
+      function setSnapMode(enabled) {
+        cancelSnapMove();
+        if (typeof enabled === 'string') enabled = enabled === 'true';
+        state.snapMode = !!enabled;
+        state.snapPressedNode = null;
+        state.snapPreview = null;
+        state.snapCandidateNode = null;
+        if (state.snapMode) syncSnapStateFromRoute();
+        render();
+      }
+      function undoStroke() {
+        cancelSnapMove();
+        if (state.snapMode) {
+          if (state.snapPressedNode || state.snapPreview) {
+            state.snapPressedNode = null; state.snapPreview = null; state.snapCandidateNode = null;
+            render();
+            return;
+          }
+          if (state.snapSegments.length) {
+            state.snapSegments.pop();
+            if (!state.snapSegments.length) state.route.strokes = [];
+            state.snapCurrentNode = state.snapSegments.length ? state.snapSegments[state.snapSegments.length - 1].to_node_id : state.snapStartNode;
+            if (!state.snapSegments.length) state.snapStartNode = state.snapCurrentNode;
+            if (!state.snapSegments.length) state.snapCurrentNode = state.snapStartNode;
+            syncSnapRouteFromSegments();
+          }
+          return;
+        }
+        if (state.currentStroke) state.currentStroke = null; else state.route.strokes.pop();
+        emitRoute(); render();
+      }
+      function clearRoute() {
+        cancelSnapMove();
+        state.route.strokes = []; state.currentStroke = null;
+        state.snapStartNode = null; state.snapCurrentNode = null; state.snapCandidateNode = null;
+        state.snapPressedNode = null; state.snapPreview = null; state.snapSegments = [];
+        state.route.road_graph = undefined;
+        emitRoute(); refreshStatus(state.drawing); render();
+      }
+      function finishStroke() {
+        cancelSnapMove();
+        if (state.snapMode) { state.snapPressedNode = null; state.snapPreview = null; render(); return; }
+        if (state.currentStroke && state.currentStroke.length) { state.route.strokes.push(state.currentStroke); state.currentStroke = null; emitRoute(); render(); }
+      }
+      function setRoadGraph(raw) {
+        cancelSnapMove();
+        try {
+          const next = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          state.roadGraph = next && Array.isArray(next.edges) ? next : {edges: []};
+          const nodes = new Map((state.roadGraph.nodes || []).map(node => [String(node.id), node]));
+          const edges = new Map(state.roadGraph.edges.map(edge => [String(edge.id), edge]));
+          const adjacency = new Map([...nodes.keys()].map(id => [id, []]));
+          for (const edge of edges.values()) {
+            const first = String(edge.start), second = String(edge.end), weight = edgeWeight(edge);
+            if (!adjacency.has(first) || !adjacency.has(second) || !Number.isFinite(weight) || weight <= 0) continue;
+            adjacency.get(first).push({edge, nodeId: second, weight});
+            if (!edge.one_way) adjacency.get(second).push({edge, nodeId: first, weight});
+          }
+          state.graphIndex = {nodes, edges, adjacency};
+          state.pathTree = null;
+          syncSnapStateFromRoute();
+          state.roadGraphRenderToken += 1;
+          renderRoadGraph();
+          render();
+        } catch (error) {
+          state.roadGraph = {edges: []};
+          state.graphIndex = {nodes: new Map(), edges: new Map(), adjacency: new Map()};
+          state.pathTree = null;
+          renderRoadGraph();
+          setStatus('路网数据错误', '已停用道路吸附');
+        }
+      }
+      function parseBounds(raw) {
+        if (!raw || typeof raw !== 'object') return null;
+        const south = Number(raw.south), west = Number(raw.west);
+        const north = Number(raw.north), east = Number(raw.east);
+        if (![south, west, north, east].every(Number.isFinite)) return null;
+        if (!(south < north && west < east)) return null;
+        return {south, west, north, east};
+      }
+      function fitTencentBounds(bounds) {
+        if (!state.tencentMap || !window.qq || !qq.maps || !qq.maps.LatLngBounds) return;
+        const parsed = parseBounds(bounds);
+        if (!parsed) return;
+        const southWest = new qq.maps.LatLng(parsed.south, parsed.west);
+        const northEast = new qq.maps.LatLng(parsed.north, parsed.east);
+        state.tencentMap.fitBounds(new qq.maps.LatLngBounds(southWest, northEast));
+      }
+      function offlinePointerPoint(event) { const rect = drawCanvas.getBoundingClientRect(); return pointFromPixel(event.clientX - rect.left, event.clientY - rect.top); }
+      function tencentPixelFromPoint(point) {
+        return tencentProjector()(point);
+      }
+      function tencentProjector() {
+        const projection = state.tencentMap.getProjection();
+        const center = projection.fromLatLngToPoint(state.tencentMap.getCenter());
+        const scale = Math.pow(2, state.tencentMap.getZoom());
+        const centerX = center.getX(), centerY = center.getY();
+        const halfWidth = width() / 2, halfHeight = height() / 2;
+        return (point) => {
+          const world = projection.fromLatLngToPoint(new qq.maps.LatLng(point.latitude, point.longitude));
+          return {x: halfWidth + (world.getX() - centerX) * scale,
+                  y: halfHeight + (world.getY() - centerY) * scale};
+        };
+      }
+      function tencentPointerPoint(event) {
+        const rect = drawCanvas.getBoundingClientRect();
+        const projection = state.tencentMap.getProjection();
+        const center = projection.fromLatLngToPoint(state.tencentMap.getCenter());
+        const scale = Math.pow(2, state.tencentMap.getZoom());
+        const pixel = new qq.maps.Point(
+          center.getX() + (event.clientX - rect.left - width() / 2) / scale,
+          center.getY() + (event.clientY - rect.top - height() / 2) / scale
+        );
+        const latLng = projection.fromPointToLatLng(pixel);
+        return {latitude: latLng.getLat(), longitude: latLng.getLng()};
+      }
+      function tencentPointAtPixel(x, y) {
+        if (!state.tencentMap || !window.qq || !qq.maps) return null;
+        const projection = state.tencentMap.getProjection();
+        const center = projection.fromLatLngToPoint(state.tencentMap.getCenter());
+        const scale = Math.pow(2, state.tencentMap.getZoom());
+        const pixel = new qq.maps.Point(
+          center.getX() + (Number(x) - width() / 2) / scale,
+          center.getY() + (Number(y) - height() / 2) / scale
+        );
+        const latLng = projection.fromPointToLatLng(pixel);
+        return {latitude: latLng.getLat(), longitude: latLng.getLng()};
+      }
+      function pointerPoint(event) { return state.tencentMap ? tencentPointerPoint(event) : offlinePointerPoint(event); }
+      function canDrawInProvider() {
+        if (!state.tencentMap) {
+          if (state.snapMode) {
+            setStatus('离线坐标网格', '节点吸附需要腾讯真实底图；请先应用 Key 或切换自由手绘');
+            return false;
+          }
+          return true;
+        }
+        if (state.route.strokes.length && state.route.coordinate_system !== 'gcj02') {
+          setStatus('腾讯地图', '现有路线为 WGS84，未自动转换；清空后再用 GCJ-02 绘制');
+          return false;
+        }
+        if (!state.route.strokes.length) { state.route.provider = 'tencent'; state.route.coordinate_system = 'gcj02'; }
+        return true;
+      }
+      function pointerPixel(event) {
+        const rect = drawCanvas.getBoundingClientRect();
+        return {x: event.clientX - rect.left, y: event.clientY - rect.top};
+      }
+      function commitSnapSelection(node) {
+        if (!node) return;
+        const nodeId = String(node.id);
+        if (!state.snapCurrentNode) {
+          state.snapStartNode = nodeId;
+          state.snapCurrentNode = nodeId;
+          syncSnapRouteFromSegments();
+          return;
+        }
+        if (nodeId === String(state.snapCurrentNode)) return;
+        const path = graphPath(state.snapCurrentNode, nodeId);
+        if (!path || !path.edgeIds.length || path.points.length < 2) {
+          setStatus('腾讯地图', '节点之间没有已声明的真实连接 · 已保留当前路线');
+          return;
+        }
+        state.snapSegments.push({
+          from_node_id: String(state.snapCurrentNode),
+          to_node_id: nodeId,
+          edge_ids: path.edgeIds.map(String)
+        });
+        state.snapCurrentNode = nodeId;
+        syncSnapRouteFromSegments();
+      }
+      let snapMoveFrame = null, pendingSnapPixel = null;
+      function cancelSnapMove() {
+        if (snapMoveFrame !== null) window.cancelAnimationFrame(snapMoveFrame);
+        snapMoveFrame = null; pendingSnapPixel = null;
+      }
+      drawCanvas.addEventListener('pointerdown', (event) => {
+        cancelSnapMove();
+        if (!state.drawing || !canDrawInProvider()) return;
+        try { drawCanvas.setPointerCapture(event.pointerId); } catch (error) { /* synthetic/offline events may lack capture */ }
+        if (state.snapMode && state.tencentMap) {
+          const pixel = pointerPixel(event);
+          const node = nodeAtPixel(pixel.x, pixel.y);
+          state.snapPressedNode = node ? String(node.id) : null;
+          updateSnapPreview(node);
+          render();
+          return;
+        }
+        const point = cleanPoint(pointerPoint(event));
+        state.currentStroke = [point];
+        render();
+      });
+      drawCanvas.addEventListener('pointermove', (event) => {
+        if (!state.drawing) return;
+        if (state.snapMode && state.tencentMap) {
+          pendingSnapPixel = pointerPixel(event);
+          if (snapMoveFrame === null) snapMoveFrame = window.requestAnimationFrame(() => {
+            const pixel = pendingSnapPixel;
+            snapMoveFrame = null; pendingSnapPixel = null;
+            if (!pixel || !state.drawing || !state.snapMode || !state.tencentMap) return;
+            updateSnapPreview(nodeAtPixel(pixel.x, pixel.y));
+            render();
+          });
+          return;
+        }
+        if (!state.currentStroke) return;
+        const point = cleanPoint(pointerPoint(event));
+        const previous = state.currentStroke[state.currentStroke.length - 1];
+        if (Math.abs(point.latitude - previous.latitude) + Math.abs(point.longitude - previous.longitude) > 0.000001) state.currentStroke.push(point);
+        render();
+      });
+      drawCanvas.addEventListener('pointerup', (event) => {
+        cancelSnapMove();
+        if (!state.drawing) return;
+        try { drawCanvas.releasePointerCapture(event.pointerId); } catch (error) {}
+        if (state.snapMode && state.tencentMap) {
+          const pixel = pointerPixel(event);
+          const node = nodeAtPixel(pixel.x, pixel.y);
+          if (state.snapPressedNode && node && String(node.id) === String(state.snapPressedNode)) commitSnapSelection(node);
+          state.snapPressedNode = null; state.snapPreview = null; state.snapCandidateNode = null; render();
+          return;
+        }
+        if (state.currentStroke) finishStroke();
+      });
+      drawCanvas.addEventListener('pointercancel', () => {
+        cancelSnapMove();
+        if (state.snapMode && state.tencentMap) { state.snapPressedNode = null; state.snapPreview = null; state.snapCandidateNode = null; render(); return; }
+        if (state.currentStroke) finishStroke();
+      });
+      drawCanvas.addEventListener('wheel', (event) => { if (state.drawing || state.tencentMap) return; event.preventDefault(); const before = pointFromPixel(event.offsetX, event.offsetY); state.view.zoom = Math.min(5, Math.max(.5, state.view.zoom * (event.deltaY < 0 ? 1.12 : .89))); const after = pointFromPixel(event.offsetX, event.offsetY); state.view.panX += (after.longitude - before.longitude) / state.view.spanLon * width() * state.view.zoom; state.view.panY -= (after.latitude - before.latitude) / state.view.spanLat * height() * state.view.zoom; render(); }, {passive: false});
+      let drag = null;
+      root.addEventListener('pointerdown', (event) => { if (state.drawing || state.tencentMap || event.target === drawCanvas) return; drag = {x: event.clientX, y: event.clientY, panX: state.view.panX, panY: state.view.panY}; root.setPointerCapture(event.pointerId); });
+      root.addEventListener('pointermove', (event) => { if (!drag) return; state.view.panX = drag.panX + event.clientX - drag.x; state.view.panY = drag.panY + event.clientY - drag.y; render(); });
+      root.addEventListener('pointerup', () => { drag = null; });
+      function disableTencent() {
+        cancelSnapMove();
+        state.roadGraphRenderToken += 1;
+        state.tencentPolylines.forEach((line) => line.setMap(null));
+        (state.tencentRoadPolylines || []).forEach((line) => line.setMap(null));
+        (state.tracePolylines || []).forEach((line) => line.setMap(null));
+        (state.roadPolylines || []).forEach((line) => line.setMap(null));
+        (state.roadNodes || []).forEach((node) => node.setMap(null));
+        state.tencentPolylines = []; state.tencentRoadPolylines = []; state.tracePolylines = []; state.roadPolylines = []; state.roadNodes = []; state.tencentMap = null;
+        tencentContainer.style.display = 'none'; offlineCanvas.style.display = 'block';
+        refreshStatus(state.drawing); render();
+      }
+      function initTencent() {
+        try {
+          if (!window.qq || !qq.maps) throw new Error('腾讯地图 API 未定义');
+          tencentContainer.style.display = 'block'; offlineCanvas.style.display = 'none';
+          if (!state.tencentMap) {
+            state.tencentMap = new qq.maps.Map(tencentContainer, {
+              center: new qq.maps.LatLng(state.view.lat, state.view.lon), zoom: 15,
+              mapTypeId: qq.maps.MapTypeId.ROADMAP,
+              draggable: true, scrollwheel: true, disableDoubleClickZoom: false,
+              keyboardShortcuts: true, mapTypeControl: false, panControl: false, zoomControl: true
+            });
+            qq.maps.event.addListener(state.tencentMap, 'tilesloaded', () => refreshStatus(state.drawing));
+            fitTencentBounds(state.view.bounds);
+          }
+          refreshStatus(state.drawing);
+          setDrawingMode(state.drawing);
+          renderRoadGraph();
+          state.routeOverlayDirty = true;
+          state.traceOverlayDirty = true;
+          state.tencentRoadOverlayDirty = true;
+          render();
+        } catch (error) {
+          disableTencent();
+          const detail = String(error && error.message ? error.message : error).slice(0, 120);
+          setStatus('离线坐标网格', '腾讯地图初始化失败：' + detail);
+        }
+      }
+      function configureTencent(raw) {
+        let config = raw || {};
+        if (typeof config === 'string') { try { config = JSON.parse(config); } catch (error) { config = {}; } }
+        state.config = config;
+        const key = String(config.key || '').trim();
+        if (!key) { state.loadingKey = ''; disableTencent(); return; }
+        if (window.qq && qq.maps) { initTencent(); return; }
+        if (state.loadingKey === key) return;
+        state.loadingKey = key;
+        setStatus('腾讯地图', '正在加载 SDK…');
+        const script = document.createElement('script');
+        script.charset = 'utf-8'; script.async = true;
+        const callbackName = '__sjtuTencentReady_' + Date.now();
+        window[callbackName] = () => {
+          try { delete window[callbackName]; } catch (error) { window[callbackName] = undefined; }
+          if (window.qq && qq.maps && typeof qq.maps.LatLng === 'function') initTencent();
+          else { disableTencent(); setStatus('离线坐标网格', '腾讯 SDK 未完成 qq.maps 加载 · 请检查 Key 权限'); }
+        };
+        script.src = 'https://map.qq.com/api/js?v=2.exp&key=' + encodeURIComponent(key) + '&callback=' + encodeURIComponent(callbackName);
+        script.onload = () => { setStatus('腾讯地图', 'SDK 已下载，正在初始化地图…'); };
+        script.onerror = () => { disableTencent(); setStatus('离线坐标网格', '腾讯 SDK 加载失败 · 请检查网络、Key 域名/权限'); };
+        document.head.appendChild(script);
+      }
+      function setMapView(raw) {
+        let view = raw || {};
+        if (typeof view === 'string') { try { view = JSON.parse(view); } catch (error) { view = {}; } }
+        const latitude = Number(view.latitude);
+        const longitude = Number(view.longitude);
+        const zoom = Number(view.zoom);
+        const bounds = parseBounds(view.bounds);
+        const shouldFit = view.fit !== false;
+        if (bounds) state.view.bounds = bounds;
+        if (![latitude, longitude, zoom].every(Number.isFinite)) return;
+        if (state.tencentMap) {
+          state.tencentMap.setCenter(new qq.maps.LatLng(latitude, longitude));
+          state.tencentMap.setZoom(Math.max(1, Math.min(20, zoom)));
+          if (shouldFit) fitTencentBounds(state.view.bounds);
+          render();
+          return;
+        }
+        state.view.lat = latitude; state.view.lon = longitude;
+        state.view.zoom = Math.max(.5, Math.min(5, zoom));
+        if (bounds) {
+          state.view.lat = (bounds.south + bounds.north) / 2;
+          state.view.lon = (bounds.west + bounds.east) / 2;
+          state.view.spanLat = bounds.north - bounds.south;
+          state.view.spanLon = bounds.east - bounds.west;
+        }
+        render();
+      }
+      window.setRoute = setRoute;
+      window.setDrawingMode = setDrawingMode;
+      window.setSnapMode = setSnapMode;
+      window.undoStroke = undoStroke;
+      window.clearRoute = clearRoute;
+      window.configureTencent = configureTencent;
+      window.setMapView = setMapView;
+      window.setRoadGraph = setRoadGraph;
+      window.setTraceOverlay = setTraceOverlay;
+      window.setTencentRoadOverlay = setTencentRoadOverlay;
+      // A small read-only probe used by the local road annotation workflow.
+      // It never fabricates geometry; callers still supply each point from a
+      // visibly verified Tencent tile.
+      window.mapPointAtPixel = tencentPointAtPixel;
+      window.finishStroke = finishStroke;
+      window.addEventListener('resize', sizeCanvas);
+      if (window.QWebChannel) new QWebChannel(qt.webChannelTransport, (channel) => { state.bridge = channel.objects.bridge; if (state.bridge && state.bridge.mapReady) state.bridge.mapReady(); });
+      sizeCanvas();
+    })();
+  </script>
+</body>
+</html>
