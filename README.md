@@ -10,12 +10,13 @@
 - 道路画笔吸附节点，预览并沿已知连接道路续画；保留自由手绘模式。
 - 按大致距离规划开放路线；闭合路线支持圈数展开。
 - 路线 JSON 保存、载入、撤销、轨迹预览及离线模拟上传。
+- 用户 ID、Keepalive、JSESSIONID 和腾讯 Key 填写后自动保存在本机，重新打开时恢复；无需先绘制路线或点击保存配置。
 - Keepalive / JSESSIONID 输入区提供交大体育网页链接。
 - 采用审核通过的飞翼路线图标，Windows 应用名称为“SJTU校园飞”。
 
 ## Windows 安装
 
-在 [Releases](https://github.com/Wangwy-sjtu/SJTU-CampusFly/releases) 下载 `SJTU-CampusFly-1.0.0-Setup-x64.exe`，运行安装。安装包包含 Python 与 Qt 运行环境，无需另外安装 Python。适用于 Windows 10/11 x64。
+在 [Releases](https://github.com/Wangwy-sjtu/SJTU-CampusFly/releases) 下载 `SJTU-CampusFly-1.0.1-Setup-x64.exe`，运行安装。安装包包含 Python 与 Qt 运行环境，无需另外安装 Python。适用于 Windows 10/11 x64。
 
 安装位置默认是当前用户的 `%LOCALAPPDATA%\Programs\SJTU-CampusFly`，不需要管理员权限。配置与路线保存在 `%LOCALAPPDATA%\SJTU-CampusFly`，升级或卸载程序不会主动删除这些用户文件。
 
@@ -62,3 +63,5 @@ ISCC.exe packaging\installer.iss
 路网来自腾讯步行接口返回的几何，使用 GCJ-02，保留来源记录。不代表校园所有小路均已覆盖；不可达节点之间不会自动补直线。腾讯地图与道路数据的权利归相应权利人。
 
 本项目从用户提供的 `SJTURunningMan-Stable` 源码包重构而来。原包未附独立 LICENSE，本仓库不替上游授予新的许可；公开可见不等同于授予无限制再分发权。依赖及来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+账户与地图凭据仅保存在本机 `configs/credentials.local.json`，停止输入 0.5 秒、离开输入框或关闭窗口时自动保存。清空字段也会被记住。记录会一直保留到用户修改或删除；学校签发的 Cookie 仍可能过期，届时需重新获取。

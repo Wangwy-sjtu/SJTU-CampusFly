@@ -45,6 +45,34 @@ class ConfigManager:
     """Load/save app settings and migrate old endpoint-only files."""
 
     @staticmethod
+    def save_credentials(user_id: str, cookie: str, map_key: str) -> None:
+        """Persist credentials independently of route/parameter validation."""
+        path = Path(CONFIGS_DIR) / "credentials.local.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({
+            "USER_ID": user_id.strip(), "COOKIE": cookie.strip(),
+            "TENCENT_MAP_KEY": map_key.strip(),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+
+    @staticmethod
+    def _load_credentials() -> dict[str, str]:
+        path = Path(CONFIGS_DIR) / "credentials.local.json"
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or any(
+                not isinstance(payload.get(key), str)
+                for key in ("USER_ID", "COOKIE", "TENCENT_MAP_KEY")
+            ):
+                raise ValueError("invalid credential fields")
+            return {key: payload[key] for key in ("USER_ID", "COOKIE", "TENCENT_MAP_KEY")}
+        except (OSError, ValueError) as exc:
+            raise ConfigError("无法读取本机保存的账户凭据，请检查 credentials.local.json。") from exc
+
+    @staticmethod
     def get_default_config() -> dict[str, Any]:
         return {
             "COOKIE": "",
@@ -153,6 +181,7 @@ class ConfigManager:
             # Keep the key in a separate ignored file.  It never becomes part
             # of the regular user configuration or route JSON.
             merged["TENCENT_MAP_KEY"] = private_key
+        merged.update(ConfigManager._load_credentials())
         if path.exists() and "ROUTE" not in loaded:
             # The old file has only four endpoint keys; preserve it through a
             # predictable one-stroke migration.
@@ -178,6 +207,7 @@ class ConfigManager:
     def save_config(config_data: Mapping[str, Any], filename: str) -> bool:
         path = ConfigManager.path_for(filename)
         config = ConfigManager.prepare_for_save(config_data)
+        ConfigManager.save_credentials(str(config.get("USER_ID", "")), str(config.get("COOKIE", "")), str(config.get("TENCENT_MAP_KEY", "")))
         ConfigManager._save_private_map_key(str(config.get("TENCENT_MAP_KEY", "")))
         config.pop("TENCENT_MAP_KEY", None)
         path.parent.mkdir(parents=True, exist_ok=True)

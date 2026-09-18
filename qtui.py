@@ -189,6 +189,14 @@ class SportsUploaderUI(QWidget):
 
         self._apply_style()
         self._build_ui()
+        self._credentials_dirty = False
+        self._credentials_timer = QTimer(self)
+        self._credentials_timer.setSingleShot(True)
+        self._credentials_timer.setInterval(500)
+        self._credentials_timer.timeout.connect(self._persist_credentials)
+        for field in (self.user_id_input, self.keepalive_input, self.jsessionid_input, self.tencent_key_input):
+            field.textEdited.connect(self._credentials_edited)
+            field.editingFinished.connect(self._persist_credentials)
         self.load_settings_to_ui(DEFAULT_CONFIG_FILE_NAME)
 
     def _apply_style(self) -> None:
@@ -371,6 +379,9 @@ class SportsUploaderUI(QWidget):
         pe_link.setOpenExternalLinks(True)
         pe_link.setToolTip("在默认浏览器中打开，方便查看并获取 Keepalive / JSESSIONID")
         connection_form.addRow("", pe_link)
+        credentials_note = QLabel("账户和地图 Key 自动保存在本机，下次打开恢复。")
+        credentials_note.setWordWrap(True)
+        connection_form.addRow("", credentials_note)
         self.tencent_key_input = QLineEdit(); self.tencent_key_input.setEchoMode(QLineEdit.Password); self.tencent_key_input.setPlaceholderText("可选：腾讯地图 JavaScript API V2 Key")
         connection_form.addRow("腾讯地图 Key", self.tencent_key_input)
         apply_map = QPushButton("应用地图凭据")
@@ -747,6 +758,7 @@ class SportsUploaderUI(QWidget):
             self.log_output_text(str(exc), "warning")
 
     def apply_map_credentials(self) -> None:
+        self._persist_credentials()
         self.map_view.set_map_credentials(self.tencent_key_input.text())
         self.log_output_text("已更新地图加载设置；底图是否覆盖校内道路需现场核验。", "info")
 
@@ -859,6 +871,7 @@ class SportsUploaderUI(QWidget):
         self.log_output_text("已将腾讯返回的首选路线写入当前路线快照；未加入完整校园路网。", "success")
 
     def load_settings_to_ui(self, filename: str) -> None:
+        self._persist_credentials()
         try:
             self.config = ConfigManager.load_config(filename)
         except ConfigError as exc:
@@ -888,6 +901,25 @@ class SportsUploaderUI(QWidget):
         self.apply_map_credentials()
         self.update_metrics()
         self.log_output_text(f"已载入配置：{os.path.basename(filename)}", "info")
+
+    def _credentials_edited(self, _text: str) -> None:
+        self._credentials_dirty = True
+        self._credentials_timer.start()
+
+    def _persist_credentials(self) -> None:
+        if not self._credentials_dirty:
+            return
+        self._credentials_timer.stop()
+        cookie = "; ".join(
+            f"{name}={field.text().strip()}"
+            for name, field in (("keepalive", self.keepalive_input), ("JSESSIONID", self.jsessionid_input))
+            if field.text().strip()
+        )
+        try:
+            ConfigManager.save_credentials(self.user_id_input.text(), cookie, self.tencent_key_input.text())
+            self._credentials_dirty = False
+        except OSError:
+            self.log_output_text("账户凭据自动保存失败，请检查本机配置目录的写入权限。", "error")
 
     def _set_cookie_fields(self, cookie: str) -> None:
         values: dict[str, str] = {}
@@ -1045,7 +1077,7 @@ class SportsUploaderUI(QWidget):
 
     def closeEvent(self, event) -> None:
         """Stop background work before Qt tears down the WebEngine child."""
-
+        self._persist_credentials()
         if self._allow_close:
             shutdown = getattr(self.map_view, "shutdown", None)
             if callable(shutdown):
