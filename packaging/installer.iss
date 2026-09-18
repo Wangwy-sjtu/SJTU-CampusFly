@@ -1,5 +1,5 @@
 #define AppName "SJTU校园飞"
-#define AppVersion "1.0.1"
+#define AppVersion "1.0.2"
 [Setup]
 AppId={{960FC7AA-6061-4BFE-8952-9A93E94F6710}
 AppName={#AppName}
@@ -12,7 +12,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\installer-output
-OutputBaseFilename=SJTU-CampusFly-1.0.1-Setup-x64
+OutputBaseFilename=SJTU-CampusFly-1.0.2-Setup-x64
 SetupIconFile=..\assets\campusfly.ico
 UninstallDisplayIcon={app}\SJTU校园飞.exe
 Compression=lzma2
