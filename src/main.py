@@ -64,6 +64,7 @@ def run_sports_upload(
     progress_callback: Callable[[int, int, str], None] | None = None,
     log_cb: Callable[[str, str], None] | None = None,
     stop_check_cb: Callable[[], bool] | None = None,
+    management_event_cb: Callable[[str], None] | None = None,
 ) -> tuple[bool, str]:
     """Run one upload using a deep-copied route snapshot.
 
@@ -154,6 +155,15 @@ def run_sports_upload(
             return False, "任务已停止。"
         if progress_callback:
             progress_callback(90, 100, "提交轨迹...")
+        # This callback is optional and deliberately isolated from the upload
+        # path.  It runs only after auth, generation and the historical-track
+        # wait have completed, immediately before the real POST.  Telemetry
+        # failures must never alter an upload result.
+        if mode == "real" and management_event_cb is not None:
+            try:
+                management_event_cb("submission_attempt")
+            except Exception:
+                pass
         response = upload_running_data(
             snapshot,
             auth_token,
@@ -175,6 +185,11 @@ def run_sports_upload(
             progress_callback(100, 100, "本地模拟完成（未上传）" if code == 0 else "本地模拟失败（未上传）")
         return code == 0, message
     if code == 0:
+        if management_event_cb is not None:
+            try:
+                management_event_cb("submission_success")
+            except Exception:
+                pass
         message = "服务器返回成功码，学校记录状态待核实；已避免重复提交。"
         log_output(message, "warning", log_cb)
         if progress_callback:

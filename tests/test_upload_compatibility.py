@@ -75,3 +75,34 @@ class UploadCompatibilityTests(unittest.TestCase):
         self.assertIn("未向学校", message)
         self.assertNotIn("上传成功", message)
         self.assertIn("未上传", progress.call_args.args[2])
+
+    def test_management_events_cover_only_real_post_boundaries(self):
+        events = []
+        with patch("src.main.get_authorization_token_and_rules", return_value=("fake", {"rules": {"id": 9}})), patch("src.main.upload_running_data", return_value={"code": 0}):
+            success, _ = run_sports_upload(config(), management_event_cb=events.append)
+        self.assertTrue(success)
+        self.assertEqual(events, ["submission_attempt", "submission_success"])
+
+        events.clear()
+        with patch("src.main.get_authorization_token_and_rules", side_effect=SportsUploaderError("auth")), patch("src.main.upload_running_data"):
+            run_sports_upload(config(), management_event_cb=events.append)
+        self.assertEqual(events, [])
+
+        events.clear()
+        with patch("src.main.time.time", return_value=1700000000), patch("src.main.get_authorization_token_and_rules", return_value=("fake", {"rules": {"id": 9}})), patch("src.main._interruptible_wait", return_value=False), patch("src.main.upload_running_data"):
+            run_sports_upload(config(), management_event_cb=events.append)
+        self.assertEqual(events, [])
+
+        events.clear()
+        mock_config = config(); mock_config["API_MODE"] = "mock"
+        run_sports_upload(mock_config, management_event_cb=events.append)
+        self.assertEqual(events, [])
+
+    def test_management_callback_failure_never_changes_upload_result(self):
+        def broken(_kind):
+            raise RuntimeError("telemetry unavailable")
+
+        with patch("src.main.get_authorization_token_and_rules", return_value=("fake", {"rules": {"id": 9}})), patch("src.main.upload_running_data", return_value={"code": 0}):
+            success, message = run_sports_upload(config(), management_event_cb=broken)
+        self.assertTrue(success)
+        self.assertIn("待核实", message)

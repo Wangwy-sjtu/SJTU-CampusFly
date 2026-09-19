@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import copy
+import html
 import json
 import math
 import os
 import sys
+import time
+from typing import Any, Callable
 
 # This must run before importing PySide6.QtWebEngine through map_view.
 from src.qt_runtime import configure_qt_runtime
@@ -53,6 +56,7 @@ from src.config_manager import (
     ConfigError,
     ConfigManager,
 )
+from src.client_management import ClientManagement
 from src.help_dialog import HelpDialog
 from src.map_view import RouteMapWidget
 from src.main import run_sports_upload
@@ -94,9 +98,17 @@ class WorkerThread(QThread):
     # deleteLater() and avoids destroying a still-running thread on shutdown.
     completed = Signal(bool, str)
 
-    def __init__(self, config_data: dict, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        config_data: dict,
+        parent: QWidget | None = None,
+        management_event_cb: Callable[[str], None] | None = None,
+        management_disabled_cb: Callable[[], bool] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.config_data = copy.deepcopy(config_data)
+        self.management_event_cb = management_event_cb
+        self.management_disabled_cb = management_disabled_cb
 
     def run(self) -> None:
         try:
@@ -104,7 +116,11 @@ class WorkerThread(QThread):
                 self.config_data,
                 progress_callback=lambda current, total, message: self.progress_update.emit(current, total, message),
                 log_cb=lambda message, level: self.log_output.emit(message, level),
-                stop_check_cb=self.isInterruptionRequested,
+                stop_check_cb=lambda: (
+                    self.isInterruptionRequested()
+                    or bool(self.management_disabled_cb and self.management_disabled_cb())
+                ),
+                management_event_cb=self.management_event_cb,
             )
         except Exception as exc:  # Keep unexpected worker errors on the UI channel.
             self.log_output.emit(f"任务异常: {redact_secrets(exc)}", "error")
@@ -155,6 +171,9 @@ class Section(QGroupBox):
 
 
 class SportsUploaderUI(QWidget):
+    management_state_changed = Signal(bool)
+    management_announcement = Signal(object)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SJTU校园飞")
@@ -179,6 +198,14 @@ class SportsUploaderUI(QWidget):
         self._tencent_overlay: dict = {"routes": []}
         self._close_pending = False
         self._allow_close = False
+        self._close_deadline = 0.0
+        self._close_timer = QTimer(self)
+        self._close_timer.setSingleShot(True)
+        self._close_timer.setInterval(100)
+        self._close_timer.timeout.connect(self._poll_close)
+        self._management_disabled = False
+        self._management_client: ClientManagement | None = None
+        self._announcement_box: QMessageBox | None = None
         self.road_graph: RoadGraph | None = None
         try:
             self.road_graph = RoadGraph.from_file(os.path.join(get_base_path(), "data", "tencent_road_graph.candidate.json"))
@@ -200,6 +227,22 @@ class SportsUploaderUI(QWidget):
         self.load_settings_to_ui(DEFAULT_CONFIG_FILE_NAME)
         self.mode_combo.currentIndexChanged.connect(self._update_upload_mode_label)
         self._update_upload_mode_label()
+        self.management_state_changed.connect(self._on_management_state_changed)
+        self.management_announcement.connect(self._on_management_announcement)
+        try:
+            # Construction is offline.  Starting this one worker is the only
+            # explicit UI-side network action.
+            self._management_client = ClientManagement(
+                on_state_changed=self.management_state_changed.emit,
+                on_announcement=self.management_announcement.emit,
+            )
+            self._on_management_state_changed(self._management_client.disabled)
+            self._management_client.start()
+        except Exception:
+            # A read-only or unavailable settings directory must not prevent
+            # local route editing.  The help page still explains the status.
+            self._management_client = None
+            self.log_output_text("管理统计暂不可用，应用仍可离线使用。", "warning")
 
     def _apply_style(self) -> None:
         self.setStyleSheet(r"""
@@ -244,9 +287,13 @@ class SportsUploaderUI(QWidget):
         title = QLabel("把路线画在校园里")
         title.setObjectName("heroTitle")
         root.addWidget(title)
+        author_note = QLabel("创作者：殇霞与夕夏 · 联网统计与服务管理说明见“帮助 / 关于”")
+        author_note.setObjectName("note")
+        root.addWidget(author_note)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
+        self._editor_splitter = splitter
         root.addWidget(splitter, 1)
 
         map_frame = QFrame()
@@ -421,7 +468,7 @@ class SportsUploaderUI(QWidget):
         self.stop_button.setObjectName("stopButton")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_upload)
-        self.help_button = QPushButton("帮助")
+        self.help_button = QPushButton("帮助 / 关于")
         self.help_button.clicked.connect(self.show_help_dialog)
         action_row.addWidget(self.upload_button, 2); action_row.addWidget(self.stop_button); action_row.addWidget(self.help_button)
         side_layout.addLayout(action_row)
@@ -432,6 +479,35 @@ class SportsUploaderUI(QWidget):
         self.log_output_area.setMaximumBlockCount(2000)
         self.log_output_area.setUndoRedoEnabled(False)
         side_layout.addStretch(1)
+
+        self._disabled_page = QFrame()
+        self._disabled_page.setObjectName("managementDisabledPage")
+        disabled_layout = QVBoxLayout(self._disabled_page)
+        disabled_layout.setContentsMargins(28, 28, 28, 28)
+        disabled_layout.setSpacing(12)
+        disabled_title = QLabel("应用已停用")
+        disabled_title.setObjectName("heroTitle")
+        disabled_layout.addWidget(disabled_title)
+        disabled_description = QLabel(
+            "管理服务当前要求此安装暂停使用。尚未提交的任务已停止；本机路线、配置和帮助内容仍保留。"
+        )
+        disabled_description.setWordWrap(True)
+        disabled_description.setObjectName("note")
+        disabled_layout.addWidget(disabled_description)
+        self._management_identity_label = QLabel()
+        self._management_identity_label.setObjectName("note")
+        self._management_identity_label.setWordWrap(True)
+        disabled_layout.addWidget(self._management_identity_label)
+        self._management_stats_label = QLabel()
+        self._management_stats_label.setObjectName("note")
+        self._management_stats_label.setWordWrap(True)
+        disabled_layout.addWidget(self._management_stats_label)
+        disabled_help_button = QPushButton("帮助 / 关于")
+        disabled_help_button.clicked.connect(self.show_help_dialog)
+        disabled_layout.addWidget(disabled_help_button, 0, Qt.AlignLeft)
+        disabled_layout.addStretch(1)
+        root.addWidget(self._disabled_page, 1)
+        self._disabled_page.hide()
 
     def route_changed(self, route_json: str) -> None:
         try:
@@ -1008,7 +1084,7 @@ class SportsUploaderUI(QWidget):
             self.draw_button.setChecked(False); self._drawing = False; self.map_view.set_drawing_mode(False)
 
     def start_upload(self) -> None:
-        if self._close_pending or self.thread is not None:
+        if self._close_pending or self.thread is not None or self._management_disabled:
             return
         try:
             config = self.get_settings_from_ui()
@@ -1019,7 +1095,17 @@ class SportsUploaderUI(QWidget):
         self.config = copy.deepcopy(config)
         self.log_output_area.clear(); self.progress.setValue(0); self.status_label.setText("状态：路线快照已锁定")
         self._set_editing_enabled(False); self.upload_button.setEnabled(False); self.stop_button.setEnabled(True); self.help_button.setEnabled(False)
-        self.thread = WorkerThread(config, self)
+        management_event_cb = None
+        management_disabled_cb = None
+        if self._management_client is not None:
+            management_event_cb = self._management_client.record_event
+            management_disabled_cb = lambda: self._management_client.disabled
+        self.thread = WorkerThread(
+            config,
+            self,
+            management_event_cb=management_event_cb,
+            management_disabled_cb=management_disabled_cb,
+        )
         self.thread.progress_update.connect(self.update_progress)
         self.thread.log_output.connect(self.log_output_text)
         self.thread.completed.connect(self.upload_finished)
@@ -1059,7 +1145,7 @@ class SportsUploaderUI(QWidget):
         thread = self.sender()
         if thread is self.thread:
             self.thread = None
-            if not self._close_pending:
+            if not self._close_pending and not self._management_disabled:
                 self._set_editing_enabled(True)
                 self.upload_button.setEnabled(True)
                 self.help_button.setEnabled(True)
@@ -1070,21 +1156,117 @@ class SportsUploaderUI(QWidget):
 
     def show_help_dialog(self) -> None:
         dialog = HelpDialog(self, markdown_relative_path=os.path.join("assets", "help.md"))
+        client = getattr(self, "_management_client", None)
+        if client is not None:
+            stats = client.stats()
+            info_html = (
+                "<h2>本机管理状态</h2>"
+                f"<p>安装编号（随机且仅用于服务管理）：<code>{html.escape(stats['installation_id'])}</code><br>"
+                f"本机计数：安装 {stats['install_count']} · "
+                f"真实提交尝试 {stats['submission_attempt_count']} · "
+                f"学校接口成功码 {stats['submission_success_count']} · "
+                f"待同步 {stats['queued_events']}<br>"
+                "当前服务状态："
+                f"{'应用已停用' if stats['disabled'] else '正常轮询'}</p>"
+            )
+            dialog.text_browser.setHtml(info_html + dialog.text_browser.toHtml())
         dialog.exec()
 
-    def _running_threads(self) -> list[QThread]:
-        return [
+    def _update_management_summary(self) -> None:
+        client = self._management_client
+        if client is None:
+            self._management_identity_label.setText("管理统计：本机保存暂不可用。")
+            self._management_stats_label.setText("联网统计与服务管理说明见“帮助 / 关于”。")
+            return
+        stats = client.stats()
+        self._management_identity_label.setText(
+            f"安装编号（随机且仅用于服务管理）：{stats['installation_id']}"
+        )
+        self._management_stats_label.setText(
+            "本机事件计数："
+            f"安装 {stats['install_count']} · "
+            f"真实提交尝试 {stats['submission_attempt_count']} · "
+            f"学校接口成功码 {stats['submission_success_count']} · "
+            f"待同步 {stats['queued_events']}\n"
+            "联网统计与服务管理说明见“帮助 / 关于”。"
+        )
+
+    def _on_management_state_changed(self, disabled: bool) -> None:
+        self._management_disabled = bool(disabled)
+        self._update_management_summary()
+        if self._management_disabled:
+            # The stop check in the upload worker cancels its wait/generation
+            # loop.  A management response never waits on the GUI thread.
+            self._set_editing_enabled(False)
+            if self.thread is not None and self.thread.isRunning():
+                self.thread.requestInterruption()
+                self.stop_button.setEnabled(False)
+            if self._tencent_road_thread is not None and self._tencent_road_thread.isRunning():
+                self._tencent_road_thread.requestInterruption()
+            self._editor_splitter.hide()
+            self._disabled_page.show()
+            return
+        self._disabled_page.hide()
+        self._editor_splitter.show()
+        if not self._close_pending and self.thread is None:
+            self._set_editing_enabled(True)
+            self.upload_button.setEnabled(True)
+            self.help_button.setEnabled(True)
+
+    def _on_management_announcement(self, announcement: object) -> None:
+        if getattr(self, "_close_pending", False) or getattr(self, "_allow_close", False):
+            return
+        if not isinstance(announcement, dict):
+            return
+        announcement_id = announcement.get("id")
+        title = announcement.get("title")
+        body = announcement.get("body")
+        if not all(isinstance(value, str) for value in (announcement_id, title, body)):
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(body)
+        box.setStandardButtons(QMessageBox.StandardButton.Close)
+        box.setModal(False)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._announcement_box = box
+        box.finished.connect(lambda _result: setattr(self, "_announcement_box", None))
+        # ``open`` is asynchronous and returns immediately; keeping the box as a
+        # field prevents it from being collected before the user dismisses it.
+        box.open()
+        box.show()
+        if self._management_client is not None:
+            self._management_client.mark_announcement_seen(announcement_id)
+
+    def _running_threads(self) -> list[Any]:
+        threads: list[Any] = [
             thread for thread in (self.thread, self._tencent_road_thread)
             if thread is not None and thread.isRunning()
         ]
+        client = getattr(self, "_management_client", None)
+        management_worker = getattr(client, "worker", None) if client is not None else None
+        if management_worker is not None and management_worker.is_alive():
+            threads.append(management_worker)
+        return threads
 
     def _poll_close(self) -> None:
         if not self._close_pending:
             return
         active = self._running_threads()
         if active:
-            QTimer.singleShot(100, self._poll_close)
+            # A standard daemon management worker is bounded by the five
+            # second request timeout.  Never destroy a live QThread; those
+            # remain subject to their normal interruption/finished signal.
+            if self._close_deadline and time.monotonic() >= self._close_deadline:
+                qt_active = [thread for thread in active if isinstance(thread, QThread)]
+                if not qt_active:
+                    self._allow_close = True
+                    self.close()
+                    return
+            self._close_timer.start()
             return
+        self._close_timer.stop()
         self._allow_close = True
         self.close()
 
@@ -1092,6 +1274,9 @@ class SportsUploaderUI(QWidget):
         """Stop background work before Qt tears down the WebEngine child."""
         self._persist_credentials()
         if self._allow_close:
+            self._close_timer.stop()
+            if self._management_client is not None:
+                self._management_client.stop(timeout=0)
             shutdown = getattr(self.map_view, "shutdown", None)
             if callable(shutdown):
                 shutdown()
@@ -1100,13 +1285,21 @@ class SportsUploaderUI(QWidget):
         active = self._running_threads()
         if active:
             self._close_pending = True
+            self._close_deadline = time.monotonic() + 8.0
+            if self._management_client is not None:
+                self._management_client.stop(timeout=0)
             for thread in active:
-                thread.requestInterruption()
+                request_interruption = getattr(thread, "requestInterruption", None)
+                if callable(request_interruption):
+                    request_interruption()
             self.status_label.setText("状态：正在结束后台任务…")
             self.setEnabled(False)
             event.ignore()
-            QTimer.singleShot(0, self._poll_close)
+            self._poll_close()
             return
+        self._close_timer.stop()
+        if self._management_client is not None:
+            self._management_client.stop(timeout=0)
         shutdown = getattr(self.map_view, "shutdown", None)
         if callable(shutdown):
             shutdown()

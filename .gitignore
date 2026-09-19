@@ -11,3 +11,8 @@ installer-output/
 *.local.json
 *.cache.json
 .env
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.env
