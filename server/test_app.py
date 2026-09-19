@@ -259,6 +259,111 @@ class BackendTests(unittest.TestCase):
         # Missing nonce is rejected before the installation lookup.
         self.assertEqual(self._request("POST", ADMIN_PATH, form, headers)[0], 403)
 
+    def test_installation_note_is_admin_only_and_persists(self):
+        installation = self._payload(events=[])
+        self.assertEqual(self._request("POST", API_PATH, installation)[0], 200)
+        headers = self._admin_headers()
+        headers["Origin"] = "https://998223.xyz"
+        note = "熟人测试机 <东南侧>"
+        page = self._admin_page()
+        form = urlencode(
+            {
+                "csrf_token": self._nonce(page),
+                "action": "save_note",
+                "installation_id": installation["installation_id"],
+                "note": note,
+            }
+        )
+        self.assertEqual(self._request("POST", ADMIN_PATH, form, headers)[0], 303)
+        row = self.app.dashboard()["rows"][0]
+        self.assertEqual(row["note"], note)
+        self.assertNotIn("note", self.app.sync(installation))
+        page = self._admin_page()
+        self.assertIn("熟人测试机 &lt;东南侧&gt;", page)
+
+        page = self._admin_page()
+        invalid_form = urlencode(
+            {
+                "csrf_token": self._nonce(page),
+                "action": "save_note",
+                "installation_id": installation["installation_id"],
+                "note": "不允许\n换行",
+            }
+        )
+        self.assertEqual(self._request("POST", ADMIN_PATH, invalid_form, headers)[0], 400)
+        self.assertEqual(self.app.dashboard()["rows"][0]["note"], note)
+
+    def test_targeted_announcements_are_scoped_and_can_be_withdrawn(self):
+        first = self._payload(events=[])
+        second = self._payload(events=[])
+        self.assertEqual(self._request("POST", API_PATH, first)[0], 200)
+        self.assertEqual(self._request("POST", API_PATH, second)[0], 200)
+        headers = self._admin_headers()
+        headers["Origin"] = "https://998223.xyz"
+
+        # Keep a global notice active, then publish a newer notice for only
+        # the first installation. Each client receives the newest matching
+        # notice without learning the target list.
+        page = self._admin_page()
+        global_form = urlencode(
+            {
+                "csrf_token": self._nonce(page),
+                "action": "publish_announcement",
+                "title": "所有人",
+                "body": "全局维护提示",
+            }
+        )
+        self.assertEqual(self._request("POST", ADMIN_PATH, global_form, headers)[0], 303)
+        page = self._admin_page()
+        targeted_form = urlencode(
+            {
+                "csrf_token": self._nonce(page),
+                "action": "publish_announcement",
+                "title": "只给第一台",
+                "body": "请重新启动",
+                "targets": first["installation_id"],
+            }
+        )
+        self.assertEqual(self._request("POST", ADMIN_PATH, targeted_form, headers)[0], 303)
+        first_announcement = self.app.sync(first)["announcement"]
+        second_announcement = self.app.sync(second)["announcement"]
+        self.assertEqual(first_announcement["title"], "只给第一台")
+        self.assertEqual(second_announcement["title"], "所有人")
+
+        snapshot = self.app.dashboard()
+        targeted = next(item for item in snapshot["announcements"] if item["title"] == "只给第一台")
+        self.assertEqual(targeted["target_ids"], [first["installation_id"]])
+
+        page = self._admin_page()
+        clear_targeted_form = urlencode(
+            {
+                "csrf_token": self._nonce(page),
+                "action": "clear_announcement",
+                "announcement_id": targeted["id"],
+            }
+        )
+        self.assertEqual(self._request("POST", ADMIN_PATH, clear_targeted_form, headers)[0], 303)
+        self.assertEqual(self.app.sync(first)["announcement"]["title"], "所有人")
+
+        page = self._admin_page()
+        unknown_form = urlencode(
+            {
+                "csrf_token": self._nonce(page),
+                "action": "publish_announcement",
+                "title": "错误目标",
+                "body": "不应发布",
+                "targets": str(uuid.uuid4()),
+            }
+        )
+        self.assertEqual(self._request("POST", ADMIN_PATH, unknown_form, headers)[0], 400)
+
+        page = self._admin_page()
+        clear_all_form = urlencode(
+            {"csrf_token": self._nonce(page), "action": "clear_announcement"}
+        )
+        self.assertEqual(self._request("POST", ADMIN_PATH, clear_all_form, headers)[0], 303)
+        self.assertIsNone(self.app.sync(first)["announcement"])
+
     def test_announcement_publish_edit_clear_persists_and_escapes_plain_text(self):
         headers = self._admin_headers()
         headers["Origin"] = "https://998223.xyz"

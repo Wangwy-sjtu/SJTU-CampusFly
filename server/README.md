@@ -17,7 +17,7 @@
 }
 ```
 
-`installation_id` 和事件 `id` 都是 UUID；`token` 是客户端首次生成并长期保存的 32 字节随机值的 64 位十六进制编码。服务器首次看到安装时自动建行，只保存 token 的 SHA-256 哈希；之后每次同步必须提供同一个 token。token 错误返回 `401`，不会更新版本、状态或事件。
+`installation_id` 和事件 `id` 都是 UUID；`installation_id` 是客户端首次启动时生成的随机安装编号，不是硬件指纹，也不携带 IP 或账户信息。`token` 是客户端首次生成并长期保存的 32 字节随机值的 64 位十六进制编码。服务器首次看到安装时自动建行，只保存 token 的 SHA-256 哈希；之后每次同步必须提供同一个 token。token 错误返回 `401`，不会更新版本、状态或事件。
 
 事件 `kind` 只能是 `install`、`submission_attempt` 或 `submission_success`。客户端只有在学校接口返回成功代码 `0` 后才发送 `submission_success`。同一安装的同一事件 UUID 只写入一次；重复请求仍会在 `acknowledged` 中确认该 ID。服务器响应固定为（没有活动公告时 `announcement` 为 `null`）：
 
@@ -25,19 +25,19 @@
 {"disabled": false, "acknowledged": ["c4b3b8e8-8e8c-4d93-a9f7-7f2a5f0ce3b5"], "announcement": null}
 ```
 
-有活动公告时，`announcement` 为 `{ "id": "公告 UUID", "title": "纯文本标题", "body": "纯文本正文" }`。公告标题最多 80 字，正文最多 2000 字；每次发布（包括编辑）都会生成新的公告 UUID。客户端应以纯文本节点显示这些字段，不把内容当作 HTML、脚本或可点击链接。
+有匹配当前安装的活动公告时，`announcement` 为 `{ "id": "公告 UUID", "title": "纯文本标题", "body": "纯文本正文" }`；没有匹配公告时为 `null`。公告标题最多 80 字，正文最多 2000 字；每次发布都会生成新的公告 UUID。留空目标安装编号表示全局公告，填写一个或多个已登记的安装编号则只发送给这些安装。客户端应以纯文本节点显示这些字段，不把内容当作 HTML、脚本或可点击链接。
 
 请求体最多 64 KiB，每批最多 100 个事件；UUID、版本、带时区的 ISO-8601 时间、事件种类和 token 都会校验。未知字段不保存。安装数量按安装 UUID 去重，尝试和成功码事件分别统计。
 
 ## 管理页
 
-`GET /campusfly/admin` 使用 HTTP Basic Auth。管理员用户名和密码只从 `CAMPUSFLY_ADMIN_USER`、`CAMPUSFLY_ADMIN_PASSWORD` 读取，源码和页面都不包含凭据。管理页通过 HTTPS 反向代理提供；写操作要求 `Origin` 精确等于 `CAMPUSFLY_ORIGIN`，并要求管理页生成的一次性 CSRF nonce。页面提供全局禁用/恢复、每个安装的本地禁用/恢复按钮，以及公告发布/编辑/撤回表单。
+`GET /campusfly/admin` 使用 HTTP Basic Auth。管理员用户名和密码只从 `CAMPUSFLY_ADMIN_USER`、`CAMPUSFLY_ADMIN_PASSWORD` 读取，源码和页面都不包含凭据。管理页通过 HTTPS 反向代理提供；写操作要求 `Origin` 精确等于 `CAMPUSFLY_ORIGIN`，并要求管理页生成的一次性 CSRF nonce。页面提供全局禁用/恢复、每个安装的本地禁用/恢复按钮、安装编号备注，以及全局或按安装编号定向的公告发布/撤回表单。
 
 全局禁用优先级最高，会让所有安装的同步响应 `disabled: true`。单个安装的“禁用”只影响该安装；“恢复”清除它的本地禁用标记，不能绕过全局禁用。该开关只影响客户端是否继续工作，不提供命令执行、更新或任意远程控制。
 
-公告发布后会持久化在私有 SQLite 数据库中，直到管理员撤回；撤回后新的 sync 响应返回 `announcement: null`。公告内容按纯文本转义到管理页，页面 CSP 禁止脚本、外部资源和表单跨域提交。
+公告发布后会持久化在私有 SQLite 数据库中，直到管理员逐条或全部撤回；同一安装同时匹配多条公告时按发布时间返回最新的一条。安装编号备注只在管理页和私有 SQLite 中保存，不会进入客户端同步响应。公告内容按纯文本转义到管理页，页面 CSP 禁止脚本、外部资源和表单跨域提交。
 
-页面使用内联 CSS、无外部资源，并且只展示安装 UUID、版本、时间及匿名计数。列表最多显示最近 500 个安装。
+页面使用内联 CSS、无外部资源，并且只展示安装 UUID、版本、时间、管理员备注及匿名计数。列表最多显示最近 500 个安装；“机器码”在页面中指随机安装编号，不是硬件机器码。
 
 ## 环境变量与启动
 
@@ -101,4 +101,4 @@ systemctl --user enable --now campusfly-management.service
 python3 -m unittest discover -s server -p 'test_*.py' -v
 ```
 
-测试覆盖安装注册和 SQLite 重启后的持久性、事件幂等、错误 token、输入限制、Basic Auth、精确 Origin、CSRF nonce、全局/单安装禁用状态、公告发布/编辑/撤回与纯文本转义，以及静默请求日志。
+测试覆盖安装注册和 SQLite 重启后的持久性、事件幂等、错误 token、输入限制、Basic Auth、精确 Origin、CSRF nonce、全局/单安装禁用状态、安装备注、全局/定向公告发布与撤回、未知目标拒绝、纯文本转义，以及静默请求日志。

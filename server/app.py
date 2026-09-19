@@ -43,8 +43,11 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_EVENTS = 100
 MAX_VERSION_LENGTH = 64
 MAX_ADMIN_ROWS = 500
+MAX_INSTALLATION_NOTE = 240
 MAX_ANNOUNCEMENT_TITLE = 80
 MAX_ANNOUNCEMENT_BODY = 2000
+MAX_ANNOUNCEMENT_TARGETS = 100
+MAX_ANNOUNCEMENT_TARGET_INPUT = 8 * 1024
 MAX_ADMIN_BODY_BYTES = 32 * 1024
 NONCE_TTL_SECONDS = 15 * 60
 
@@ -121,6 +124,18 @@ def _normalise_announcement_text(value: Any, field: str, limit: int) -> str:
     # a client UI.
     if any(ord(character) < 32 and character not in "\t\r\n" for character in value):
         raise RequestValidationError(f"{field} contains unsupported control characters")
+    return value
+
+
+def _normalise_installation_note(value: Any) -> str:
+    """Validate the private, administrator-only note for one installation."""
+
+    if not isinstance(value, str) or len(value) > MAX_INSTALLATION_NOTE:
+        raise RequestValidationError("note is invalid")
+    # Notes are rendered into a single-line form control. Reject all C0
+    # controls, including line breaks, while retaining ordinary punctuation.
+    if any(ord(character) < 32 for character in value):
+        raise RequestValidationError("note contains unsupported control characters")
     return value
 
 
@@ -271,6 +286,7 @@ class Database:
                     version TEXT NOT NULL,
                     first_seen TEXT NOT NULL,
                     last_seen TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
                     disabled_override INTEGER NOT NULL DEFAULT -1
                         CHECK (disabled_override IN (-1, 0, 1))
                 );
@@ -300,8 +316,32 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS announcements_active_idx
                     ON announcements(active, published_at DESC);
+
+                CREATE TABLE IF NOT EXISTS announcement_targets (
+                    announcement_id TEXT NOT NULL,
+                    installation_id TEXT NOT NULL,
+                    PRIMARY KEY (announcement_id, installation_id),
+                    FOREIGN KEY (announcement_id) REFERENCES announcements(announcement_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (installation_id) REFERENCES installations(installation_id)
+                        ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS announcement_targets_installation_idx
+                    ON announcement_targets(installation_id, announcement_id);
                 """
             )
+            # Existing deployments were created before administrator notes
+            # existed. SQLite can add this nullable-free column safely with a
+            # default, preserving all installation rows during upgrade.
+            installation_columns = {
+                str(row[1])
+                for row in self._connection.execute("PRAGMA table_info(installations)")
+            }
+            if "note" not in installation_columns:
+                self._connection.execute(
+                    "ALTER TABLE installations ADD COLUMN note TEXT NOT NULL DEFAULT ''"
+                )
+            self._connection.commit()
 
     @staticmethod
     def _hash_token(token: str) -> str:
@@ -365,7 +405,7 @@ class Database:
                     "SELECT value FROM settings WHERE key = 'global_disabled'"
                 ).fetchone()
                 global_disabled = bool(global_row and global_row["value"] == "1")
-                announcement = self._active_announcement_unlocked()
+                announcement = self._active_announcement_unlocked(installation_id)
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()
@@ -380,11 +420,34 @@ class Database:
             "announcement": announcement,
         }
 
-    def _active_announcement_unlocked(self) -> dict[str, str] | None:
-        row = self._connection.execute(
-            "SELECT announcement_id, title, body FROM announcements "
-            "WHERE active = 1 ORDER BY published_at DESC LIMIT 1"
-        ).fetchone()
+    def _active_announcement_unlocked(
+        self, installation_id: str | None = None
+    ) -> dict[str, str] | None:
+        if installation_id is None:
+            # The dashboard compatibility helper returns the newest global
+            # announcement. A targeted notice must never be exposed without a
+            # specific installation context.
+            query = (
+                "SELECT announcement_id, title, body FROM announcements AS a "
+                "WHERE a.active = 1 AND NOT EXISTS ("
+                "SELECT 1 FROM announcement_targets AS t "
+                "WHERE t.announcement_id = a.announcement_id) "
+                "ORDER BY a.published_at DESC, a.rowid DESC LIMIT 1"
+            )
+            parameters: tuple[str, ...] = ()
+        else:
+            query = (
+                "SELECT a.announcement_id, a.title, a.body FROM announcements AS a "
+                "WHERE a.active = 1 AND ("
+                "NOT EXISTS (SELECT 1 FROM announcement_targets AS t "
+                "WHERE t.announcement_id = a.announcement_id) OR "
+                "EXISTS (SELECT 1 FROM announcement_targets AS t "
+                "WHERE t.announcement_id = a.announcement_id "
+                "AND t.installation_id = ?)) "
+                "ORDER BY a.published_at DESC, a.rowid DESC LIMIT 1"
+            )
+            parameters = (installation_id,)
+        row = self._connection.execute(query, parameters).fetchone()
         if row is None:
             return None
         return {
@@ -393,22 +456,29 @@ class Database:
             "body": str(row["body"]),
         }
 
-    def active_announcement(self) -> dict[str, str] | None:
+    def active_announcement(self, installation_id: str | None = None) -> dict[str, str] | None:
         with self._lock:
-            return self._active_announcement_unlocked()
+            return self._active_announcement_unlocked(installation_id)
 
-    def publish_announcement(self, title: str, body: str) -> str:
+    def publish_announcement(
+        self, title: str, body: str, target_ids: Iterable[str] = ()
+    ) -> str:
         announcement_id = str(uuid.uuid4())
         now = _utc_now()
+        targets = list(dict.fromkeys(target_ids))
         with self._lock:
             self._begin()
             try:
-                self._connection.execute("UPDATE announcements SET active = 0 WHERE active = 1")
                 self._connection.execute(
                     "INSERT INTO announcements "
                     "(announcement_id, title, body, published_at, active) "
                     "VALUES (?, ?, ?, ?, 1)",
                     (announcement_id, title, body, now),
+                )
+                self._connection.executemany(
+                    "INSERT INTO announcement_targets (announcement_id, installation_id) "
+                    "VALUES (?, ?)",
+                    ((announcement_id, installation_id) for installation_id in targets),
                 )
                 self._connection.commit()
             except Exception:
@@ -416,11 +486,20 @@ class Database:
                 raise
         return announcement_id
 
-    def clear_announcement(self) -> None:
+    def clear_announcement(self, announcement_id: str | None = None) -> None:
         with self._lock:
             self._begin()
             try:
-                self._connection.execute("UPDATE announcements SET active = 0 WHERE active = 1")
+                if announcement_id is None:
+                    self._connection.execute("UPDATE announcements SET active = 0 WHERE active = 1")
+                else:
+                    cursor = self._connection.execute(
+                        "UPDATE announcements SET active = 0 "
+                        "WHERE announcement_id = ? AND active = 1",
+                        (announcement_id,),
+                    )
+                    if cursor.rowcount != 1:
+                        raise NotFoundError()
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()
@@ -456,6 +535,36 @@ class Database:
                 self._connection.rollback()
                 raise
 
+    def set_installation_note(self, installation_id: str, note: str) -> None:
+        with self._lock:
+            self._begin()
+            try:
+                cursor = self._connection.execute(
+                    "UPDATE installations SET note = ? WHERE installation_id = ?",
+                    (note, installation_id),
+                )
+                if cursor.rowcount != 1:
+                    raise NotFoundError()
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def missing_installations(self, installation_ids: Iterable[str]) -> list[str]:
+        """Return target IDs that are not known to the management database."""
+
+        ids = list(dict.fromkeys(installation_ids))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT installation_id FROM installations WHERE installation_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        known = {str(row["installation_id"]) for row in rows}
+        return [installation_id for installation_id in ids if installation_id not in known]
+
     def dashboard(self, limit: int = MAX_ADMIN_ROWS) -> dict[str, Any]:
         with self._lock:
             global_row = self._connection.execute(
@@ -469,7 +578,7 @@ class Database:
             ).fetchone()
             rows = self._connection.execute(
                 "SELECT i.installation_id, i.version, i.first_seen, i.last_seen, "
-                "i.disabled_override, "
+                "i.disabled_override, i.note, "
                 "COALESCE(SUM(CASE WHEN e.kind = 'submission_attempt' THEN 1 ELSE 0 END), 0) AS attempts, "
                 "COALESCE(SUM(CASE WHEN e.kind = 'submission_success' THEN 1 ELSE 0 END), 0) AS successes "
                 "FROM installations AS i LEFT JOIN events AS e "
@@ -478,29 +587,45 @@ class Database:
                 "ORDER BY i.last_seen DESC LIMIT ?",
                 (max(1, min(int(limit), MAX_ADMIN_ROWS)),),
             ).fetchall()
+            announcements = self._dashboard_announcements_unlocked()
         return {
             "global_disabled": bool(global_row and global_row["value"] == "1"),
             "installations": int(counts["installations"]),
             "attempts": int(counts["attempts"]),
             "successes": int(counts["successes"]),
-            "announcement": self._dashboard_announcement(),
+            # Keep the singular field for older callers; the page uses the
+            # complete active list so targeted notices can coexist with a
+            # global notice.
+            "announcement": announcements[0] if announcements else None,
+            "announcements": announcements,
             "rows": [dict(row) for row in rows],
         }
 
-    def _dashboard_announcement(self) -> dict[str, str] | None:
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT announcement_id, title, body, published_at FROM announcements "
-                "WHERE active = 1 ORDER BY published_at DESC LIMIT 1"
-            ).fetchone()
-        if row is None:
-            return None
-        return {
-            "id": str(row["announcement_id"]),
-            "title": str(row["title"]),
-            "body": str(row["body"]),
-            "published_at": str(row["published_at"]),
-        }
+    def _dashboard_announcements_unlocked(self) -> list[dict[str, Any]]:
+        rows = self._connection.execute(
+            "SELECT a.announcement_id, a.title, a.body, a.published_at, "
+            "COUNT(t.installation_id) AS target_count, "
+            "GROUP_CONCAT(t.installation_id, ',') AS target_ids "
+            "FROM announcements AS a LEFT JOIN announcement_targets AS t "
+            "ON t.announcement_id = a.announcement_id "
+            "WHERE a.active = 1 "
+            "GROUP BY a.announcement_id "
+            "ORDER BY a.published_at DESC, a.rowid DESC"
+        ).fetchall()
+        announcements: list[dict[str, Any]] = []
+        for row in rows:
+            raw_targets = str(row["target_ids"] or "")
+            announcements.append(
+                {
+                    "id": str(row["announcement_id"]),
+                    "title": str(row["title"]),
+                    "body": str(row["body"]),
+                    "published_at": str(row["published_at"]),
+                    "target_count": int(row["target_count"]),
+                    "target_ids": raw_targets.split(",") if raw_targets else [],
+                }
+            )
+        return announcements
 
     def close(self) -> None:
         with self._lock:
@@ -602,12 +727,27 @@ class CampusFlyApplication:
             body = _normalise_announcement_text(
                 form.get("body", [""])[0], "body", MAX_ANNOUNCEMENT_BODY
             )
-            self.db.publish_announcement(title, body)
+            targets = _normalise_announcement_targets(
+                form.get("targets", [""])[0], self.db
+            )
+            self.db.publish_announcement(title, body, targets)
             return
         if action == "clear_announcement":
-            if scope or installation_id:
+            if scope:
                 raise RequestValidationError("announcement action cannot name an installation")
-            self.db.clear_announcement()
+            announcement_id = form.get("announcement_id", [""])[0]
+            if installation_id:
+                raise RequestValidationError("announcement action cannot name an installation")
+            if announcement_id:
+                announcement_id = _normalise_uuid(announcement_id, "announcement_id")
+            self.db.clear_announcement(announcement_id or None)
+            return
+        if action == "save_note":
+            if scope not in {"", "installation", "install"}:
+                raise RequestValidationError("unknown admin scope")
+            installation_id = _normalise_uuid(installation_id, "installation_id")
+            note = _normalise_installation_note(form.get("note", [""])[0])
+            self.db.set_installation_note(installation_id, note)
             return
         if action not in {"disable", "restore", "inherit"}:
             raise RequestValidationError("unknown admin action")
@@ -633,6 +773,29 @@ class CampusFlyApplication:
         self.db.close()
 
 
+def _normalise_announcement_targets(value: Any, db: Database) -> list[str]:
+    """Parse a bounded comma/newline/space separated target list."""
+
+    if not isinstance(value, str) or len(value) > MAX_ANNOUNCEMENT_TARGET_INPUT:
+        raise RequestValidationError("targets are invalid")
+    parts = [part for part in re.split(r"[\s,]+", value.strip()) if part]
+    if len(parts) > MAX_ANNOUNCEMENT_TARGETS:
+        raise RequestValidationError(
+            f"at most {MAX_ANNOUNCEMENT_TARGETS} announcement targets are allowed"
+        )
+    targets: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        target = _normalise_uuid(part, "target installation_id")
+        if target not in seen:
+            seen.add(target)
+            targets.append(target)
+    missing = db.missing_installations(targets)
+    if missing:
+        raise RequestValidationError("targets contain an unknown installation_id")
+    return targets
+
+
 def _parse_json(raw: bytes) -> Any:
     try:
         return json.loads(
@@ -652,34 +815,58 @@ def render_dashboard(snapshot: Mapping[str, Any], nonce: str) -> bytes:
 
     global_disabled = bool(snapshot["global_disabled"])
     global_state = "已禁用" if global_disabled else "运行中"
-    active_announcement = snapshot.get("announcement")
-    announcement_title = _html_text(active_announcement["title"]) if active_announcement else ""
-    announcement_body = _html_text(active_announcement["body"]) if active_announcement else ""
+    announcements = list(snapshot.get("announcements") or [])
     announcement_meta = (
-        f"当前公告 ID {_html_text(active_announcement['id'])}，发布时间 {_html_text(active_announcement['published_at'])} UTC。"
-        if active_announcement
-        else "当前没有活动公告。"
+        f"当前有 {len(announcements)} 条活动公告；留空目标编号表示发送给全部安装。"
+        if announcements
+        else "当前没有活动公告；留空目标编号表示发送给全部安装。"
     )
-    clear_announcement_form = (
+    announcement_items: list[str] = []
+    for item in announcements:
+        target_ids = [str(value) for value in item.get("target_ids", [])]
+        target_label = "全部安装" if not target_ids else f"定向 {len(target_ids)} 台安装"
+        target_details = (
+            ""
+            if not target_ids
+            else f"<details><summary>查看目标编号</summary><code>{_html_text(', '.join(target_ids))}</code></details>"
+        )
+        announcement_items.append(
+            "<article class=active-announcement>"
+            f"<div><strong>{_html_text(item['title'])}</strong>"
+            f"<span class=announcement-scope>{_html_text(target_label)}</span></div>"
+            f"<p class=announcement-body>{_html_text(item['body'])}</p>"
+            f"<p class=subtle>公告 ID {_html_text(item['id'])} · 发布时间 {_html_text(item['published_at'])} UTC</p>"
+            f"{target_details}"
+            "<form method=post action=/campusfly/admin class=announcement-clear>"
+            f"<input type=hidden name=csrf_token value=\"{_html_text(nonce)}\">"
+            f"<input type=hidden name=announcement_id value=\"{_html_text(item['id'])}\">"
+            "<button name=action value=clear_announcement type=submit>撤回这条</button></form>"
+            "</article>"
+        )
+    active_announcements_html = "".join(announcement_items) or '<p class=subtle>没有活动公告。</p>'
+    clear_all_announcement_form = (
         "<form method=post action=/campusfly/admin class=announcement-clear>"
         f"<input type=hidden name=csrf_token value=\"{_html_text(nonce)}\">"
-        "<button name=action value=clear_announcement type=submit>撤回公告</button></form>"
-        if active_announcement
+        "<button name=action value=clear_announcement type=submit>撤回全部公告</button></form>"
+        if announcements
         else ""
     )
     announcement_html = (
         "<section class=\"panel announcement\" aria-label=\"启动公告\">"
         "<h2>启动公告</h2>"
-        "<p class=subtle>客户端显示纯文本；每次发布都会生成新的公告 ID。</p>"
+        "<p class=subtle>客户端只显示纯文本；每次发布都会生成新的公告 ID。目标编号可用逗号、空格或换行分隔。</p>"
         f"<p class=subtle>{announcement_meta}</p>"
+        f"<div class=active-announcements>{active_announcements_html}</div>"
         "<form method=post action=/campusfly/admin>"
         f"<input type=hidden name=csrf_token value=\"{_html_text(nonce)}\">"
         "<label for=announcement-title>标题（最多 80 字）</label>"
-        f"<input id=announcement-title name=title maxlength={MAX_ANNOUNCEMENT_TITLE} value=\"{announcement_title}\" required>"
+        f"<input id=announcement-title name=title maxlength={MAX_ANNOUNCEMENT_TITLE} required>"
         "<label for=announcement-body>正文（最多 2000 字）</label>"
-        f"<textarea id=announcement-body name=body maxlength={MAX_ANNOUNCEMENT_BODY} rows=7 required>{announcement_body}</textarea>"
+        f"<textarea id=announcement-body name=body maxlength={MAX_ANNOUNCEMENT_BODY} rows=7 required></textarea>"
+        f"<label for=announcement-targets>目标安装编号（最多 {MAX_ANNOUNCEMENT_TARGETS} 个；留空=全部）</label>"
+        f"<textarea id=announcement-targets name=targets maxlength={MAX_ANNOUNCEMENT_TARGET_INPUT} rows=4 placeholder=\"每行一个安装编号\"></textarea>"
         "<div class=announcement-actions><button name=action value=publish_announcement type=submit>发布/更新</button></div></form>"
-        f"{clear_announcement_form}</section>"
+        f"{clear_all_announcement_form}</section>"
     )
     rows_html: list[str] = []
     for row in snapshot["rows"]:
@@ -691,6 +878,7 @@ def render_dashboard(snapshot: Mapping[str, Any], nonce: str) -> bytes:
         else:
             state = "运行中"
         installation_id = _html_text(row["installation_id"])
+        note = _html_text(row.get("note", ""))
         rows_html.append(
             "<tr>"
             f"<td><code>{installation_id}</code></td>"
@@ -700,6 +888,11 @@ def render_dashboard(snapshot: Mapping[str, Any], nonce: str) -> bytes:
             f"<td>{int(row['attempts'])}</td>"
             f"<td>{int(row['successes'])}</td>"
             f"<td>{_html_text(state)}</td>"
+            "<td class=note><form method=post action=/campusfly/admin class=note-form>"
+            f"<input type=hidden name=csrf_token value=\"{_html_text(nonce)}\">"
+            f"<input type=hidden name=installation_id value=\"{installation_id}\">"
+            f"<input name=note maxlength={MAX_INSTALLATION_NOTE} value=\"{note}\" aria-label=\"{installation_id} 备注\">"
+            "<button name=action value=save_note type=submit>保存</button></form></td>"
             "<td class=actions>"
             "<form method=post action=/campusfly/admin>"
             f"<input type=hidden name=csrf_token value=\"{_html_text(nonce)}\">"
@@ -710,7 +903,7 @@ def render_dashboard(snapshot: Mapping[str, Any], nonce: str) -> bytes:
             "</form></td></tr>"
         )
     if not rows_html:
-        rows_html.append('<tr><td colspan="8" class=empty>还没有匿名安装记录。</td></tr>')
+        rows_html.append('<tr><td colspan="9" class=empty>还没有匿名安装记录。</td></tr>')
     page = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -739,6 +932,13 @@ textarea {{ resize:vertical; min-height:120px; }}
 .announcement {{ margin:18px 0; }}
 .announcement-actions {{ display:flex; align-items:center; gap:10px; margin-top:12px; }}
 .announcement-clear {{ display:inline; }}
+.active-announcements {{ display:grid; gap:10px; margin:14px 0 18px; }}
+.active-announcement {{ border:1px solid #e7ebf2; border-radius:10px; padding:12px; }}
+.active-announcement strong {{ margin-right:8px; }}
+.announcement-scope {{ color:#156b4b; font-size:.82rem; }}
+.announcement-body {{ margin:8px 0; white-space:pre-wrap; overflow-wrap:anywhere; }}
+.active-announcement details {{ margin:6px 0 8px; font-size:.8rem; }}
+.active-announcement details code {{ white-space:pre-wrap; overflow-wrap:anywhere; }}
 button {{ border:1px solid #b8c4d6; border-radius:8px; background:#fff; color:#172033; padding:7px 11px; cursor:pointer; }}
 button:hover {{ background:#edf3fc; }}
 button[value=disable] {{ color:#a54130; }}
@@ -746,6 +946,9 @@ table {{ width:100%; border-collapse:collapse; margin-top:16px; font-size:.9rem;
 th,td {{ padding:10px 8px; text-align:left; border-bottom:1px solid #e7ebf2; white-space:nowrap; }}
 th {{ color:#596579; font-weight:600; font-size:.8rem; }}
 code {{ font-size:.78rem; }}
+.note {{ white-space:normal; min-width:190px; }}
+.note-form {{ display:flex; align-items:center; gap:6px; min-width:190px; }}
+.note-form input {{ min-width:0; }}
 .actions form {{ display:flex; gap:6px; }}
 .empty {{ text-align:center; color:#66748a; padding:28px; }}
 @media (max-width:700px) {{ main {{ padding:22px 12px 32px; }} .cards {{ grid-template-columns:1fr; }} .panel {{ padding:12px; }} }}
@@ -769,7 +972,7 @@ code {{ font-size:.78rem; }}
 </form>
 </section>
 <section class=panel aria-label="安装列表">
-<table><caption class=subtle>时间均为 UTC</caption><thead><tr><th>安装 ID</th><th>版本</th><th>首次同步</th><th>最近同步</th><th>提交尝试</th><th>接口成功码事件</th><th>状态</th><th>操作</th></tr></thead>
+<table><caption class=subtle>时间均为 UTC；安装 ID 是客户端生成的随机编号，不是硬件指纹</caption><thead><tr><th>安装 ID</th><th>版本</th><th>首次同步</th><th>最近同步</th><th>提交尝试</th><th>接口成功码事件</th><th>状态</th><th>机器码备注</th><th>操作</th></tr></thead>
 <tbody>{''.join(rows_html)}</tbody></table>
 <p class=subtle>最多显示最近 {MAX_ADMIN_ROWS} 个安装；统计按客户端生成的 UUID 去重。</p>
 </section>
