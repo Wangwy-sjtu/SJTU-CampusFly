@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import datetime
+import math
 import time
 from typing import Any, Callable, Mapping
 
@@ -30,16 +31,23 @@ def _interruptible_wait(
     if seconds <= 0:
         return True
     end = time.monotonic() + seconds
+    last_second = None
     while True:
         if stop_check_cb and stop_check_cb():
             return False
         remaining = end - time.monotonic()
         if remaining <= 0:
             return True
+        remaining_seconds = math.ceil(remaining)
+        if progress_callback and remaining_seconds != last_second:
+            progress_callback(70, 100, f"等待轨迹结束，剩余 {remaining_seconds} 秒（尚未提交）")
+            last_second = remaining_seconds
         time.sleep(min(0.2, remaining))
 
 
 def _validate_upload_config(config: Mapping[str, Any]) -> None:
+    if str(config.get("API_MODE", "real")).lower() not in {"mock", "real"}:
+        raise ValidationError("上传模式无效，请明确选择本地模拟或提交到学校。")
     validate_run_parameters(config.get("RUNNING_SPEED_MPS"), config.get("INTERVAL_SECONDS"))
     if str(config.get("API_MODE", "real")).lower() != "mock":
         if not str(config.get("COOKIE", "")).strip() or not str(config.get("USER_ID", "")).strip():
@@ -132,10 +140,11 @@ def run_sports_upload(
 
     if progress_callback:
         progress_callback(70, 100, "准备上传...")
-    should_wait = bool(snapshot.get("WAIT_BEFORE_UPLOAD", mode != "mock"))
-    if should_wait and snapshot.get("START_TIME_EPOCH_MS") is None:
-        log_output(f"等待轨迹时长 {total_duration} 秒后上传。", callback=log_cb)
-        if not _interruptible_wait(total_duration, progress_callback, stop_check_cb):
+    last_point_ms = max(point["locatetime"] for track in payload[0]["tracks"] for point in track["points"])
+    remaining = max(0, math.ceil(last_point_ms / 1000 - time.time()))
+    if mode == "real" and remaining > 0:
+        log_output(f"轨迹尚未结束，等待 {remaining} 秒后提交；此时还未向学校上传。", callback=log_cb)
+        if not _interruptible_wait(remaining, progress_callback, stop_check_cb):
             return False, "任务已停止。"
     elif snapshot.get("START_TIME_EPOCH_MS") is not None:
         log_output("使用历史开始时间，跳过等待。", callback=log_cb)
@@ -159,14 +168,17 @@ def run_sports_upload(
         return False, str(exc)
 
     code = response.get("code")
-    if code == 0:
-        if response.get("data"):
-            message = "上传已确认。"
-        else:
-            message = "服务器返回成功码，记录状态待核实；已避免重复提交。"
-        log_output(message, "success" if response.get("data") else "warning", log_cb)
+    if mode == "mock":
+        message = "本地模拟完成，未向学校提交任何记录。" if code == 0 else f"本地模拟失败，响应代码: {code!r}；未向学校提交。"
+        log_output(message, "info" if code == 0 else "error", log_cb)
         if progress_callback:
-            progress_callback(100, 100, "上传成功")
+            progress_callback(100, 100, "本地模拟完成（未上传）" if code == 0 else "本地模拟失败（未上传）")
+        return code == 0, message
+    if code == 0:
+        message = "服务器返回成功码，学校记录状态待核实；已避免重复提交。"
+        log_output(message, "warning", log_cb)
+        if progress_callback:
+            progress_callback(100, 100, "请求已提交，记录待核实")
         return True, message
 
     message = f"上传被服务器拒绝，响应代码: {code!r}"

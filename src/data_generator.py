@@ -251,8 +251,12 @@ def generate_running_data_payload(
     total_distance = distance_before
     total_duration = math.ceil(total_distance / speed) if total_distance > 0 else 0
     rules = dict((point_rules_data or {}).get("rules", {}))
-    # Preserve the server rule ID exactly; in particular, do not turn 6 into 9.
-    run_id = rules.get("id", config.get("RULE_ID", 6))
+    # The live rule endpoint omits id. The original client used 6 then mapped
+    # that fallback to 9. Keep explicit server IDs, but match its absent-ID path.
+    run_id = rules.get("id")
+    if run_id is None:
+        run_id = config.get("RULE_ID", 9)
+        log_output(f"学校规则未含编号，采用兼容编号 {run_id}。", "info", log_cb)
     sp_avg = _pace_minutes_per_km(total_distance, total_distance / speed if speed else 0, rules)
     payload = [{
         "fravg": 0,

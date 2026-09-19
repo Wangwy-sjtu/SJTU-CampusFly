@@ -16,7 +16,7 @@
 
 ## Windows 安装
 
-在 [Releases](https://github.com/Wangwy-sjtu/SJTU-CampusFly/releases) 下载 `SJTU-CampusFly-1.0.2-Setup-x64.exe`，运行安装。安装包包含 Python 与 Qt 运行环境，无需另外安装 Python。适用于 Windows 10/11 x64。
+在 [Releases](https://github.com/Wangwy-sjtu/SJTU-CampusFly/releases) 下载 `SJTU-CampusFly-1.0.3-Setup-x64.exe`，运行安装。安装包包含 Python 与 Qt 运行环境，无需另外安装 Python。适用于 Windows 10/11 x64。
 
 安装位置默认是当前用户的 `%LOCALAPPDATA%\Programs\SJTU-CampusFly`，不需要管理员权限。配置与路线保存在 `%LOCALAPPDATA%\SJTU-CampusFly`，升级或卸载程序不会主动删除这些用户文件。
 

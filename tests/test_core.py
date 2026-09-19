@@ -397,7 +397,8 @@ class ValidationAndUploadTests(unittest.TestCase):
 
     def test_empty_success_response_is_not_retried(self) -> None:
         config = {
-            "API_MODE": "mock",
+            "API_MODE": "real",
+            "COOKIE": "test-cookie",
             "MOCK_BEHAVIOR": "empty",
             "USER_ID": "test",
             "RUNNING_SPEED_MPS": 2.0,
@@ -412,7 +413,7 @@ class ValidationAndUploadTests(unittest.TestCase):
             calls.append(1)
             return {"code": 0, "data": None}
 
-        with patch("src.main.upload_running_data", side_effect=one_call):
+        with patch("src.main.upload_running_data", side_effect=one_call), patch("src.main.get_authorization_token_and_rules", return_value=("test-token", {"rules": {"id": 9}})):
             success, message = run_sports_upload(config)
         self.assertTrue(success)
         self.assertEqual(len(calls), 1)

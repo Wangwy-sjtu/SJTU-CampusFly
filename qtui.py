@@ -198,6 +198,8 @@ class SportsUploaderUI(QWidget):
             field.textEdited.connect(self._credentials_edited)
             field.editingFinished.connect(self._persist_credentials)
         self.load_settings_to_ui(DEFAULT_CONFIG_FILE_NAME)
+        self.mode_combo.currentIndexChanged.connect(self._update_upload_mode_label)
+        self._update_upload_mode_label()
 
     def _apply_style(self) -> None:
         self.setStyleSheet(r"""
@@ -368,7 +370,7 @@ class SportsUploaderUI(QWidget):
 
         connection = Section("连接与地图")
         connection_form = QFormLayout(connection)
-        self.mode_combo = QComboBox(); self.mode_combo.addItem("离线模拟（推荐）", "mock"); self.mode_combo.addItem("真实接口（需凭据）", "real")
+        self.mode_combo = QComboBox(); self.mode_combo.addItem("本地模拟（不上传到学校）", "mock"); self.mode_combo.addItem("提交到学校（需凭据）", "real")
         connection_form.addRow("上传模式", self.mode_combo)
         self.user_id_input = QLineEdit(); self.user_id_input.setPlaceholderText("真实接口才需要")
         connection_form.addRow("用户 ID", self.user_id_input)
@@ -1025,6 +1027,9 @@ class SportsUploaderUI(QWidget):
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
+    def _update_upload_mode_label(self) -> None:
+        self.upload_button.setText("提交到学校" if self.mode_combo.currentData() == "real" else "开始本地模拟（不上传）")
+
     def stop_upload(self) -> None:
         if self.thread and self.thread.isRunning():
             self.thread.requestInterruption(); self.stop_button.setEnabled(False); self.status_label.setText("状态：正在停止…"); self.log_output_text("已发送停止请求。", "warning")
@@ -1042,6 +1047,10 @@ class SportsUploaderUI(QWidget):
             return
         self.stop_button.setEnabled(False)
         self.progress.setValue(100 if success else self.progress.value())
+        if self.config.get("API_MODE") == "mock":
+            self.status_label.setText("状态：本地模拟完成，未上传到学校" if success else "状态：本地模拟失败，未上传到学校")
+            self.log_output_text(message, "info" if success else "error")
+            return
         pending = "待核实" in message
         self.status_label.setText("状态：已提交，待核实" if pending else ("状态：上传成功" if success else "状态：上传失败"))
         self.log_output_text(message, "warning" if pending else ("success" if success else "error"))

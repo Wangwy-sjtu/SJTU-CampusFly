@@ -9,6 +9,9 @@ from urllib.parse import quote
 
 import requests
 
+APP_USER_AGENT = "Mozilla/5.0 (Linux; Android 12; SM-S9080 Build/V417IR; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/138.0.7204.67 Safari/537.36 TaskCenterApp/3.5.0"
+RULE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+
 from src.route_model import route_endpoints, route_from_legacy_config
 from src.utils import SportsUploaderError, log_output, redact_secrets
 
@@ -92,7 +95,9 @@ def get_authorization_token_and_rules(
     common_headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json;charset=utf-8",
-        "User-Agent": "SJTU-RunningMan/2.0",
+        "User-Agent": APP_USER_AGENT,
+        "X-Requested-With": "edu.sjtu.infoplus.taskcenter",
+        "Host": str(config["HOST"]),
         "Referer": "https://pe.sjtu.edu.cn/phone/",
         "Cookie": str(config.get("COOKIE", "")),
     }
@@ -101,7 +106,9 @@ def get_authorization_token_and_rules(
         "GET", uid_url, common_headers, log_cb=log_cb,
         stop_check_cb=stop_check_cb, session=session,
     )
-    data = uid_response.get("data") or {}
+    data = uid_response.get("data")
+    if not isinstance(data, dict):
+        raise SportsUploaderError("登录响应无有效账户信息，请重新获取登录凭据。")
     token = data.get("uid") if uid_response.get("code") == 0 else None
     if not token:
         raise SportsUploaderError("未能获取服务器授权信息。")
@@ -120,7 +127,8 @@ def get_authorization_token_and_rules(
     point_headers = {
         "Accept": "application/json, text/plain, */*",
         "Authorization": str(token),
-        "User-Agent": "SJTU-RunningMan/2.0",
+        "User-Agent": RULE_USER_AGENT,
+        "Host": str(config["HOST"]),
         "Referer": f"{config['POINT_RULE_URL']}?location={quote(location, safe='')}",
     }
     rules_response = make_request(
@@ -128,9 +136,11 @@ def get_authorization_token_and_rules(
         params={"location": location}, log_cb=log_cb,
         stop_check_cb=stop_check_cb, session=session,
     )
-    rules = rules_response.get("data") or {}
-    if not isinstance(rules, dict):
-        raise SportsUploaderError("服务器规则响应格式无效。")
+    if rules_response.get("code") != 0:
+        raise SportsUploaderError(f"服务器拒绝规则请求，响应代码: {rules_response.get('code')!r}；未提交轨迹。")
+    rules = rules_response.get("data")
+    if not isinstance(rules, dict) or not isinstance(rules.get("rules"), dict) or not rules["rules"]:
+        raise SportsUploaderError("服务器未返回有效跑步规则，已停止上传。")
     return str(token), rules
 
 
@@ -168,7 +178,9 @@ def upload_running_data(
         "Authorization": str(auth_token),
         "Content-Type": "application/json; charset=utf-8",
         "Accept-Encoding": "gzip",
-        "User-Agent": "SJTU-RunningMan/2.0",
+        "User-Agent": "okhttp/4.10.0",
+        "Host": str(config["HOST"]),
+        "Connection": "Keep-Alive",
     }
     response = make_request(
         "POST", str(config["UPLOAD_URL"]), headers,
